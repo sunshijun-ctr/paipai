@@ -1,0 +1,54 @@
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+httpx>=0.26.0
+openai>=1.12.0
+anthropic>=0.20.0
+python-dotenv>=1.0.0
+cryptography>=42.0.0
+
+# Search backends
+requests>=2.31.0
+feedparser>=6.0.11
+
+# Download backends
+beautifulsoup4>=4.12.0
+
+# PDF parsing
+pymupdf>=1.23.0
+python-pptx>=0.6.23
+matplotlib>=3.8.0
+llama-index>=0.10.0
+llama-parse>=0.4.0
+
+# Vector store
+chromadb>=0.5.0
+
+# Text splitting
+langchain-text-splitters>=0.3.0
+langgraph>=0.2.0
+
+# Optional RAG evaluation backend (set EVAL_BACKEND=ragas)
+# ragas>=0.2.0
+# datasets>=2.18.0
+
+# Optional image understanding OCR backend (used by analyze_image_tool)
+# paddleocr>=2.7.0
+# paddlepaddle>=2.6.0
+
+# Reranking (FlashRank default; swap to sentence-transformers for CrossEncoder)
+flashrank>=0.2.0
+# sentence-transformers>=3.0.0  # uncomment to enable CrossEncoderReranker
+
+# BM25 keyword retrieval
+rank_bm25>=0.2.0
+
+# Web server
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+pywebview>=5.0
+
+# PostgreSQL note storage
+psycopg[binary]>=3.1.18
+
+# To be enabled later:
+# redis>=5.0.0

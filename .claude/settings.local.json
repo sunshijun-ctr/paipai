@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(& \"E:\\\\Study-Agent\\\\research-assistant\\\\fix_encoding.ps1\")"
+    ]
+  }
+}

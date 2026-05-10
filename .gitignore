@@ -1,0 +1,65 @@
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+
+# Python cache and test cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Local runtime logs
+*.log
+*.out
+*.err
+research-assistant/data/codex_server_*.log
+research-assistant/data/codex_server_*.out.log
+research-assistant/data/codex_server_*.err.log
+
+# Local app data, test data, uploads, generated artifacts
+data/
+research-assistant/data/
+uploads/
+downloads/
+exports/
+reports/
+tmp/
+temp/
+
+# Local databases and vector stores
+*.sqlite
+*.sqlite3
+*.db
+*.duckdb
+chroma/
+chroma_lt/
+bm25/
+
+# Desktop/webview profiles and browser state
+desktop-profile/
+webview-profile/
+research-assistant/data/desktop-profile/
+research-assistant/data/webview-profile/
+
+# Generated documents and large local assets
+*.pdf
+*.docx
+*.pptx
+*.xlsx
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
