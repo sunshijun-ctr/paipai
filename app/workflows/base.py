@@ -9,7 +9,10 @@ from app.state.task_state import TaskState
 
 logger = logging.getLogger(__name__)
 
-ProgressCallback = Callable[[str, str, int | None], Awaitable[None]]
+# Callable(step, text, pct, *, data) → Awaitable[None]. `data` is an
+# optional dict the WS handler relays as a richer side-channel event
+# (currently used by ResearchAgent's HITL plan card).
+ProgressCallback = Callable[..., Awaitable[None]]
 BuildAgentInput = Callable[[str, str, TaskState], AgentInput]
 
 
@@ -20,6 +23,13 @@ class AgentWorkflowState(TypedDict, total=False):
     total_agents: int
     done_agents: int
     stopped: bool
+    # ── ResearchAgent's multi-node graph (plan → execute → synthesize) ──
+    # uses these to thread state between nodes. They're optional because
+    # every other workflow ignores them.
+    plan: dict
+    step_results: list
+    final_text: str
+    timings: dict
 
 
 def build_sequence_graph(
@@ -90,6 +100,11 @@ def make_agent_node(
             return state
 
         agent_input = build_agent_input(agent_name, state["user_query"], task_state)
+        # Make the progress callback available to agents that emit live
+        # per-iteration updates (currently ResearchAgent). Other agents
+        # ignore the extra context key.
+        agent_input.context.setdefault("__progress__", progress)
+        agent_input.context.setdefault("__workflow_name__", workflow_name)
         logger.info("[%s] [%s] Running %s...", task_state.task_id, workflow_name, agent_name)
         await progress(agent_name, agent_running_text(agent_name), 35 + int(done_agents / total_agents * 40))
         output = await agent.run(agent_input, task_state)
@@ -138,14 +153,14 @@ def has_uploaded_writing_docs(task_state: TaskState) -> bool:
 def agent_short_name(agent: str) -> str:
     return {
         "literature_agent": "literature search",
-        "retrieval_agent": "knowledge retrieval",
-        "reading_agent": "reading",
+        "rag_agent": "RAG",
+        # retrieval_agent/reading_agent deprecated — use rag_agent instead
+        "research_agent": "research",
         "web_agent": "web search and reading",
         "writing_agent": "writing",
         "summary_agent": "summary",
         "note_agent": "note",
         "general_agent": "general planning",
-        "chat_agent": "chat",
         "analyze_image": "image analysis",
     }.get(agent, agent)
 
@@ -153,14 +168,13 @@ def agent_short_name(agent: str) -> str:
 def agent_running_text(agent: str) -> str:
     return {
         "literature_agent": "Searching and filtering papers...",
-        "retrieval_agent": "Retrieving relevant library passages...",
-        "reading_agent": "Reading materials and preparing an answer...",
+        "rag_agent": "Retrieving relevant chunks and reading...",
+        "research_agent": "Researching: composing tools (search / fetch / notes)...",
         "web_agent": "Searching the web, reading pages, and preparing an answer...",
         "writing_agent": "Generating writing content from selected materials...",
         "summary_agent": "Summarizing the current conversation...",
         "note_agent": "Processing note task...",
         "general_agent": "Planning and executing the open task...",
-        "chat_agent": "Generating reply...",
         "analyze_image": "Analyzing uploaded image...",
     }.get(agent, f"Running {agent_short_name(agent)}...")
 
@@ -168,13 +182,12 @@ def agent_running_text(agent: str) -> str:
 def agent_done_text(agent: str) -> str:
     return {
         "literature_agent": "Paper processing complete.",
-        "retrieval_agent": "Knowledge retrieval complete.",
-        "reading_agent": "Reading complete.",
+        "rag_agent": "Retrieval + reading complete.",
+        "research_agent": "Research complete.",
         "web_agent": "Web reading complete.",
         "writing_agent": "Writing content generated.",
         "summary_agent": "Summary complete.",
         "note_agent": "Note task complete.",
         "general_agent": "Open task handled.",
-        "chat_agent": "Reply generated.",
         "analyze_image": "Image analysis complete.",
     }.get(agent, f"{agent_short_name(agent)} complete.")

@@ -1,0 +1,155 @@
+# =============================================================================
+# Caddyfile — Research Assistant 生产部署模板
+# =============================================================================
+# 配套实现 frontend-migration.md 阶段 1 的 #1.2 / #1.5 / #1.7：
+#   #1.2  Content-Security-Policy
+#   #1.5  gzip + 静态资源长缓存 + HTML no-cache
+#   #1.7  X-Content-Type-Options / X-Frame-Options / Referrer-Policy / Permissions-Policy
+#
+# 拿到域名后，把所有 ${YOUR_DOMAIN} 替换成你的实际域名（如 paipai.example.com）。
+# 然后 systemctl reload caddy 即可。证书 Caddy 自动签发。
+# =============================================================================
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# 生产模式 — 有域名 + HTTPS + Let's Encrypt
+# ────────────────────────────────────────────────────────────────────────────
+
+${YOUR_DOMAIN} {
+
+    # ── 通用安全响应头（#1.7）─────────────────────────────────────────────
+    header {
+        # 防 MIME sniffing：浏览器必须按 Content-Type 解析
+        X-Content-Type-Options "nosniff"
+        # 防 clickjacking：禁止跨域 iframe 嵌入本站
+        X-Frame-Options "SAMEORIGIN"
+        # Referrer 泄漏控制：跨域只发 origin，不带 path
+        Referrer-Policy "strict-origin-when-cross-origin"
+        # 关闭不用的浏览器能力（按需调整）
+        Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=()"
+        # 老 IE/Edge 的 XSS 过滤器（现代浏览器已不依赖，但写上不亏）
+        X-XSS-Protection "1; mode=block"
+        # HSTS：六个月强制 HTTPS。第一次上线建议先短时间（300）观察一周，OK 再切长
+        Strict-Transport-Security "max-age=15552000; includeSubDomains"
+    }
+
+    # ── Content-Security-Policy（#1.2）────────────────────────────────────
+    # 已用的外部资源：
+    #   marked / dompurify / mermaid / echarts / pdf.js / katex / tabler-icons
+    #   全部来自 cdn.jsdelivr.net
+    # 'unsafe-inline' 在 script-src / style-src 上短期保留，等阶段 2.3 把
+    # inline event handler 清理掉后可以收紧成 nonce-based CSP。
+    header Content-Security-Policy "
+        default-src 'self';
+        script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://browser.sentry-cdn.com;
+        style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net;
+        img-src 'self' data: blob: https:;
+        font-src 'self' data: https://cdn.jsdelivr.net;
+        connect-src 'self' wss://${YOUR_DOMAIN} https://*.sentry.io https://*.ingest.sentry.io;
+        media-src 'self' blob:;
+        worker-src 'self' blob:;
+        frame-ancestors 'self';
+        base-uri 'self';
+        form-action 'self';
+    "
+
+    # ── 压缩（#1.5）── encode 自动协商：客户端支持哪个就用哪个 ───────────
+    encode zstd gzip
+
+    # ── 反代路由 ─────────────────────────────────────────────────────────
+    # API + WS 全部转给 uvicorn；静态资源也走 uvicorn（FastAPI 的 /static/*）。
+    # 阶段 2 拆出 dist/ 后这里再切换让 Caddy 直接服务静态文件。
+
+    # WebSocket 走 /ws/* — 必须先匹配，否则会被静态规则吃掉
+    @ws path /ws /ws/*
+    reverse_proxy @ws localhost:8000
+
+    # 静态资源：长缓存 + immutable。配合 server.py 的 ?v=<version> 工作。
+    @static path /static/* /auth.js /auth.css
+    handle @static {
+        header Cache-Control "public, max-age=31536000, immutable"
+        reverse_proxy localhost:8000
+    }
+
+    # API：no-store，永不缓存
+    @api path /api/* /openapi.json /docs /redoc
+    handle @api {
+        header Cache-Control "no-store"
+        reverse_proxy localhost:8000
+    }
+
+    # HTML 主页面 / 登录 / 注册：no-cache（每次都校验，依赖 ETag/Last-Modified）
+    # 这样改一次 index.html，用户刷新立即拿新版
+    handle {
+        header Cache-Control "no-cache"
+        reverse_proxy localhost:8000
+    }
+
+    # ── 访问日志 ─────────────────────────────────────────────────────────
+    log {
+        output file /var/log/caddy/access.log {
+            roll_size 10mb
+            roll_keep 5
+        }
+        format json
+    }
+}
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# 本地 dev 模式 — 没有域名 / 不要 HTTPS，纯本地跑
+# 用法：caddy run --config Caddyfile.dev
+# 把下面这段单独存成 Caddyfile.dev，去掉外层 :8080 之前的注释即可
+# ────────────────────────────────────────────────────────────────────────────
+#
+# :8080 {
+#     encode zstd gzip
+#
+#     header {
+#         X-Content-Type-Options "nosniff"
+#         X-Frame-Options "SAMEORIGIN"
+#         Referrer-Policy "strict-origin-when-cross-origin"
+#     }
+#
+#     # dev 用宽松 CSP，方便排查；正式环境用上面的严格版
+#     header Content-Security-Policy "
+#         default-src 'self' 'unsafe-inline' 'unsafe-eval' http: https: ws: wss: data: blob:;
+#         img-src * data: blob:;
+#     "
+#
+#     @ws path /ws /ws/*
+#     reverse_proxy @ws localhost:8000
+#
+#     @static path /static/* /auth.js /auth.css
+#     handle @static {
+#         header Cache-Control "public, max-age=300"
+#         reverse_proxy localhost:8000
+#     }
+#
+#     handle {
+#         reverse_proxy localhost:8000
+#     }
+# }
+
+
+# =============================================================================
+# 拿到域名后的迁移步骤
+# =============================================================================
+#  1. DNS 把 ${YOUR_DOMAIN} 的 A 记录指向云服务器公网 IP
+#  2. 这个文件全文 `sed -i 's/\${YOUR_DOMAIN}/paipai.example.com/g'`
+#  3. 复制到 /etc/caddy/Caddyfile
+#  4. systemctl reload caddy
+#  5. 等几十秒 Caddy 自动签 Let's Encrypt 证书，访问 https://paipai.example.com
+#  6. 改 .env：
+#        AUTH_COOKIE_SECURE=true
+#        AUTH_PUBLIC_BASE_URL=https://paipai.example.com
+#     重启 uvicorn
+#  7. 浏览器 DevTools 验收：
+#        - 响应头里能看到所有上面配的 X-*、CSP、HSTS
+#        - 静态资源响应头 `Cache-Control: public, max-age=31536000, immutable`
+#        - HTML 响应头 `Cache-Control: no-cache`
+#        - 控制台执行 `eval("alert(1)")` 被 CSP 阻止
+#        - 控制台执行 `fetch("/api/chat", {method:"POST", body:""})` 在浏览器
+#          内可以跑（因为同源）；从外部域名跨源调同样请求被 SameSite cookie
+#          拦下
+# =============================================================================

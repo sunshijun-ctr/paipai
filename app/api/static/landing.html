@@ -1,0 +1,902 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>paipai · 你的科研助手</title>
+<meta name="description" content="paipai — AI 驱动的研究助手，从文献检索到论文写作，让你的科研更专注。">
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  /* ── Purple palette (matches the dynamic paipai SVG) ── */
+  --p:        #534AB7;     /* indigo — primary */
+  --p-dark:   #3B348A;     /* deeper indigo */
+  --p-mid:    #7B5FC0;     /* mid violet */
+  --p-vivid:  #9B6FD4;     /* vibrant purple */
+  --p-soft:   #AFA9EC;     /* lavender */
+  --p-wash:   #F0EBFB;     /* near-white lavender */
+  --p-wash-2: #E5DEFB;
+  --green:    #1D9E75;     /* small accent — same green that ends the logo gradient */
+  --pink:     #F472B6;     /* tertiary highlight */
+  --bg:       #FAF8FF;     /* hint-of-lavender white */
+  --ink:      #1A1530;     /* purple-black */
+  --ink-2:    #2A1F4D;
+  --ink-3:    #6B5F8A;
+  --line:     rgba(83, 74, 183, .12);
+  --glass:        rgba(255, 255, 255, .65);
+  --glass-strong: rgba(255, 255, 255, .85);
+}
+
+html, body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  background: var(--bg);
+  color: var(--ink);
+  font-size: 15px;
+  line-height: 1.65;
+  overflow-x: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+a { color: inherit; text-decoration: none; }
+button { font: inherit; cursor: pointer; }
+
+/* ── Animated background ────────────────────────────────────────────── */
+.bg-canvas {
+  position: fixed; inset: 0; z-index: -2;
+  background:
+    radial-gradient(ellipse 80% 50% at 20% 0%,  rgba(83, 74, 183, .14)  0%, transparent 60%),
+    radial-gradient(ellipse 60% 40% at 90% 20%, rgba(155, 111, 212, .14) 0%, transparent 55%),
+    radial-gradient(ellipse 70% 50% at 50% 100%, rgba(29, 158, 117, .07) 0%, transparent 60%),
+    var(--bg);
+}
+
+.bg-grid {
+  position: fixed; inset: 0; z-index: -1; opacity: .35; pointer-events: none;
+  background-image:
+    linear-gradient(to right, rgba(83, 74, 183, .07) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(83, 74, 183, .07) 1px, transparent 1px);
+  background-size: 64px 64px;
+  mask-image: radial-gradient(ellipse 60% 80% at 50% 30%, #000 30%, transparent 100%);
+}
+
+.orb {
+  position: fixed; border-radius: 50%; filter: blur(80px); pointer-events: none; z-index: -1;
+  animation: orb-float 18s ease-in-out infinite;
+  will-change: transform;
+}
+.orb.o1 { top: -120px; left: -100px; width: 480px; height: 480px;
+  background: radial-gradient(circle, rgba(83, 74, 183, .55), transparent 65%); }
+.orb.o2 { top: 30vh; right: -160px; width: 520px; height: 520px;
+  background: radial-gradient(circle, rgba(155, 111, 212, .50), transparent 65%);
+  animation-delay: -6s; }
+.orb.o3 { bottom: -180px; left: 30%; width: 420px; height: 420px;
+  background: radial-gradient(circle, rgba(244, 114, 182, .26), transparent 65%);
+  animation-delay: -12s; }
+@keyframes orb-float {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  33%      { transform: translate(40px, -30px) scale(1.05); }
+  66%      { transform: translate(-30px, 40px) scale(.95); }
+}
+
+/* ── Top nav ────────────────────────────────────────────────────────── */
+.nav {
+  position: sticky; top: 0; z-index: 100;
+  backdrop-filter: saturate(180%) blur(16px);
+  -webkit-backdrop-filter: saturate(180%) blur(16px);
+  background: rgba(250, 248, 255, .72);
+  border-bottom: 1px solid var(--line);
+}
+.nav-inner {
+  max-width: 1200px; margin: 0 auto;
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 28px;
+}
+
+/* ── Brand (dynamic SVG logo) ────────────────────────────────────────── */
+.brand { display: inline-flex; align-items: center; gap: 8px; min-width: 0; }
+.logo-svg { animation: logo-float 3.6s ease-in-out infinite; overflow: visible; flex: 0 0 auto; }
+.brand:hover .logo-svg { animation: none; }
+.p-back, .p-front {
+  font-family: system-ui, sans-serif; font-size: 52px; font-weight: 600;
+  transition: transform .35s cubic-bezier(.34, 1.56, .64, 1), opacity .35s ease;
+}
+.p-back  { fill: url(#grad-back);  opacity: .72; transform-origin: 20px 44px; }
+.p-front { fill: url(#grad-front); opacity: .92; transform-origin: 38px 38px;
+  transition-delay: .04s; }
+.brand:hover .p-back  { transform: translate(-3px, 2px) scale(1.06); opacity: .88; }
+.brand:hover .p-front { transform: translate(3px, -2px) scale(1.06); opacity: 1; }
+@keyframes logo-float { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-3px); } }
+.wordmark {
+  font-family: system-ui, sans-serif; font-size: 22px; font-weight: 500;
+  background: linear-gradient(110deg, #534AB7 0%, #9B6FD4 50%, #1D9E75 100%);
+  -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
+  letter-spacing: .03em;
+  transition: letter-spacing .35s cubic-bezier(.34, 1.56, .64, 1);
+  white-space: nowrap;
+}
+.brand:hover .wordmark { letter-spacing: .08em; }
+
+.nav-links { display: flex; align-items: center; gap: 8px; }
+.nav-link, button.nav-link {
+  padding: 8px 14px; border-radius: 8px; font-size: 14px; font-weight: 500;
+  color: var(--ink-2); transition: background .15s;
+  border: 0; background: transparent; cursor: pointer; font-family: inherit;
+}
+.nav-link:hover, button.nav-link:hover { background: var(--p-wash); color: var(--p-dark); }
+.nav-cta, button.nav-cta {
+  padding: 9px 18px; border-radius: 10px; font-weight: 600; font-size: 14px;
+  background: var(--ink); color: #fff; cursor: pointer; border: 0;
+  font-family: inherit;
+  transition: transform .12s, box-shadow .15s;
+}
+.nav-cta:hover, button.nav-cta:hover { transform: translateY(-1px); box-shadow: 0 8px 18px rgba(26, 21, 48, .22); }
+
+/* ── Hero ───────────────────────────────────────────────────────────── */
+.hero {
+  max-width: 1200px; margin: 0 auto; padding: 84px 28px 80px;
+  display: grid; grid-template-columns: 1.1fr 1fr; gap: 60px; align-items: center;
+}
+.hero-eyebrow {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 6px 14px; border-radius: 999px;
+  background: var(--glass); border: 1px solid var(--line);
+  font-size: 12px; font-weight: 600; color: var(--p-dark);
+  margin-bottom: 22px;
+  backdrop-filter: blur(6px);
+}
+.hero-eyebrow .pulse {
+  width: 7px; height: 7px; border-radius: 50%; background: var(--p);
+  box-shadow: 0 0 0 0 rgba(83, 74, 183, .7); animation: pulse 2s infinite;
+}
+@keyframes pulse {
+  0%   { box-shadow: 0 0 0 0 rgba(83, 74, 183, .55); }
+  70%  { box-shadow: 0 0 0 12px rgba(83, 74, 183, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(83, 74, 183, 0); }
+}
+
+.hero h1 {
+  font-size: clamp(40px, 6vw, 68px);
+  line-height: 1.05; font-weight: 800; letter-spacing: -0.025em;
+  margin-bottom: 22px;
+}
+.hero h1 .grad {
+  background: linear-gradient(120deg, #534AB7 0%, #7B5FC0 35%, #9B6FD4 70%, #1D9E75 100%);
+  background-size: 200% 200%;
+  -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
+  animation: shimmer 6s ease-in-out infinite;
+}
+@keyframes shimmer {
+  0%, 100% { background-position: 0% 50%; }
+  50%      { background-position: 100% 50%; }
+}
+.hero p.lead {
+  font-size: 18px; color: var(--ink-3); max-width: 560px; margin-bottom: 36px;
+}
+
+.cta-row { display: flex; gap: 14px; flex-wrap: wrap; }
+.btn {
+  padding: 14px 28px; border-radius: 12px; font-weight: 700; font-size: 15px;
+  border: 0; transition: transform .12s, box-shadow .2s, background .2s;
+  display: inline-flex; align-items: center; gap: 8px;
+}
+.btn-primary {
+  background: linear-gradient(135deg, #534AB7 0%, #3B348A 60%, #7B5FC0 100%);
+  color: #fff; position: relative; overflow: hidden;
+  box-shadow: 0 10px 28px rgba(83, 74, 183, .38);
+}
+.btn-primary::before {
+  content: ''; position: absolute; inset: 0;
+  background: linear-gradient(120deg, transparent 30%, rgba(255,255,255,.35) 50%, transparent 70%);
+  transform: translateX(-100%); transition: transform .8s;
+}
+.btn-primary:hover { transform: translateY(-2px); box-shadow: 0 16px 36px rgba(83, 74, 183, .48); }
+.btn-primary:hover::before { transform: translateX(100%); }
+.btn-ghost {
+  background: var(--glass); color: var(--ink); border: 1px solid var(--line);
+  backdrop-filter: blur(6px);
+}
+.btn-ghost:hover { background: var(--glass-strong); transform: translateY(-2px); }
+
+/* Hero visual */
+.hero-visual { position: relative; min-height: 460px; }
+.hero-card {
+  position: absolute; padding: 18px 20px;
+  background: var(--glass-strong); border: 1px solid var(--line);
+  border-radius: 16px; backdrop-filter: blur(12px);
+  box-shadow: 0 24px 64px rgba(83, 74, 183, .16);
+  font-size: 13px;
+  animation: card-float 7s ease-in-out infinite;
+}
+.hero-card .card-h { display: flex; align-items: center; gap: 8px; font-weight: 700; margin-bottom: 8px; font-size: 13px; }
+.hero-card .card-i { width: 22px; height: 22px; border-radius: 6px; display: grid; place-items: center; font-size: 13px; }
+.hero-card .card-b { color: var(--ink-3); line-height: 1.5; }
+
+.hero-card.c1 { top: 30px; left: 0; width: 280px; }
+.hero-card.c1 .card-i { background: var(--p-wash); color: var(--p-dark); }
+.hero-card.c2 { top: 180px; left: 50%; transform: translateX(-30%); width: 300px; animation-delay: -2.3s; }
+.hero-card.c2 .card-i { background: #f3e8ff; color: #6d28d9; }
+.hero-card.c3 { bottom: 30px; left: 30px; width: 290px; animation-delay: -4.6s; }
+.hero-card.c3 .card-i { background: #d1fae5; color: #047857; }
+
+@keyframes card-float {
+  0%, 100% { transform: translateY(0) translateX(var(--tx, 0)); }
+  50%      { transform: translateY(-12px) translateX(var(--tx, 0)); }
+}
+.hero-card.c2 { --tx: -30%; }
+
+.hero-rings {
+  position: absolute; inset: 0; display: grid; place-items: center; pointer-events: none;
+}
+.hero-rings .ring {
+  position: absolute; border-radius: 50%; border: 1.5px dashed rgba(83, 74, 183, .22);
+  animation: rotate 60s linear infinite;
+}
+.hero-rings .ring.r1 { width: 360px; height: 360px; }
+.hero-rings .ring.r2 { width: 480px; height: 480px; animation-direction: reverse; animation-duration: 90s; border-style: dotted; }
+@keyframes rotate { to { transform: rotate(360deg); } }
+
+/* ── Stats strip ────────────────────────────────────────────────────── */
+.stats {
+  max-width: 1200px; margin: 0 auto; padding: 0 28px 24px;
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 24px;
+}
+.stat {
+  background: var(--glass); border: 1px solid var(--line);
+  border-radius: 14px; padding: 20px 22px;
+  backdrop-filter: blur(8px);
+}
+.stat-num {
+  font-size: 30px; font-weight: 800; letter-spacing: -0.02em;
+  background: linear-gradient(120deg, #534AB7, #9B6FD4 60%, #1D9E75);
+  -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
+}
+.stat-lbl { font-size: 13px; color: var(--ink-3); margin-top: 2px; }
+
+/* ── Sections ───────────────────────────────────────────────────────── */
+.section {
+  max-width: 1200px; margin: 0 auto; padding: 100px 28px;
+}
+.section-head { text-align: center; margin-bottom: 56px; }
+.section-tag {
+  display: inline-block; padding: 5px 12px; border-radius: 999px;
+  background: var(--p-wash); color: var(--p-dark);
+  font-size: 12px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase;
+  margin-bottom: 14px;
+}
+.section h2 {
+  font-size: clamp(28px, 4vw, 42px); font-weight: 800; letter-spacing: -0.02em;
+  line-height: 1.15;
+}
+.section h2 .grad {
+  background: linear-gradient(120deg, #534AB7, #9B6FD4 70%, #1D9E75);
+  -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
+}
+.section .lead {
+  color: var(--ink-3); max-width: 580px; margin: 14px auto 0;
+}
+
+/* Feature cards */
+.feature-grid {
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 20px;
+}
+.feature {
+  position: relative; padding: 28px 24px; border-radius: 18px;
+  background: var(--glass-strong); border: 1px solid var(--line);
+  backdrop-filter: blur(8px);
+  transition: transform .25s, box-shadow .25s, border-color .25s;
+  overflow: hidden;
+}
+.feature::before {
+  content: ''; position: absolute; inset: -1px; border-radius: 18px; padding: 1px;
+  background: linear-gradient(135deg, transparent 50%, rgba(83, 74, 183, .35) 100%);
+  -webkit-mask: linear-gradient(#000, #000) content-box, linear-gradient(#000, #000);
+  -webkit-mask-composite: xor; mask-composite: exclude;
+  opacity: 0; transition: opacity .25s; pointer-events: none;
+}
+.feature:hover { transform: translateY(-6px); box-shadow: 0 24px 60px rgba(83, 74, 183, .20); }
+.feature:hover::before { opacity: 1; }
+.feature-ico {
+  width: 44px; height: 44px; border-radius: 12px;
+  background: linear-gradient(135deg, var(--p-wash), #ddd0fa);
+  display: grid; place-items: center; font-size: 22px;
+  margin-bottom: 18px;
+  box-shadow: inset 0 0 0 1px rgba(83, 74, 183, .14);
+}
+.feature h3 { font-size: 17px; font-weight: 700; margin-bottom: 8px; letter-spacing: -0.01em; }
+.feature p { color: var(--ink-3); font-size: 14px; line-height: 1.6; }
+
+/* Workflow */
+.workflow {
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 0;
+  position: relative;
+}
+.workflow::before {
+  content: ''; position: absolute; top: 32px; left: 8%; right: 8%; height: 2px;
+  background: linear-gradient(90deg, #534AB7 0%, #9B6FD4 50%, #1D9E75 100%);
+  opacity: .3; z-index: 0;
+}
+.step { text-align: center; padding: 0 18px; position: relative; z-index: 1; }
+.step-num {
+  width: 64px; height: 64px; margin: 0 auto 18px;
+  border-radius: 50%; display: grid; place-items: center;
+  background: #fff; border: 2px solid var(--p);
+  font-size: 22px; font-weight: 800; color: var(--p-dark);
+  box-shadow: 0 10px 24px rgba(83, 74, 183, .18);
+  transition: transform .2s;
+}
+.step:hover .step-num { transform: scale(1.06); }
+.step h4 { font-size: 16px; font-weight: 700; margin-bottom: 6px; }
+.step p { color: var(--ink-3); font-size: 13px; }
+
+/* CTA section */
+.cta-banner {
+  max-width: 1080px; margin: 60px auto 80px; padding: 64px 56px;
+  border-radius: 28px; position: relative; overflow: hidden;
+  background: linear-gradient(135deg, #3B348A 0%, #534AB7 45%, #9B6FD4 100%);
+  color: #fff;
+  box-shadow: 0 32px 80px rgba(83, 74, 183, .38);
+}
+.cta-banner::before {
+  content: ''; position: absolute; inset: 0;
+  background:
+    radial-gradient(ellipse 50% 70% at 80% 20%, rgba(255, 255, 255, .18), transparent),
+    radial-gradient(ellipse 40% 60% at 20% 80%, rgba(244, 114, 182, .28), transparent);
+  pointer-events: none;
+}
+.cta-banner > * { position: relative; }
+.cta-banner h2 { font-size: clamp(28px, 4vw, 40px); margin-bottom: 14px; }
+.cta-banner p { color: rgba(255, 255, 255, .88); max-width: 600px; margin-bottom: 28px; font-size: 16px; }
+.cta-banner .btn-primary { background: #fff; color: var(--p-dark); box-shadow: 0 10px 28px rgba(0, 0, 0, .18); }
+.cta-banner .btn-primary:hover { color: var(--ink); }
+.cta-banner .btn-ghost { background: rgba(255, 255, 255, .14); color: #fff; border-color: rgba(255, 255, 255, .3); }
+.cta-banner .btn-ghost:hover { background: rgba(255, 255, 255, .22); }
+
+/* Footer */
+footer {
+  border-top: 1px solid var(--line); padding: 32px 28px;
+  text-align: center; color: var(--ink-3); font-size: 13px;
+  background: rgba(255, 255, 255, .55); backdrop-filter: blur(8px);
+}
+footer .foot-inner { max-width: 1200px; margin: 0 auto; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 12px; }
+footer a { color: var(--ink-2); }
+footer a:hover { color: var(--p-dark); }
+
+/* ── Auth modal — login + register inline ───────────────────────────── */
+.am-overlay {
+  position: fixed; inset: 0; z-index: 5000;
+  background: rgba(26, 21, 48, .42);
+  backdrop-filter: blur(8px) saturate(140%);
+  -webkit-backdrop-filter: blur(8px) saturate(140%);
+  display: none; align-items: center; justify-content: center;
+  padding: 24px;
+}
+.am-overlay.open { display: flex; animation: am-fade .22s ease; }
+@keyframes am-fade { from { opacity: 0; } to { opacity: 1; } }
+
+.am-card {
+  width: min(440px, 100%); max-height: calc(100vh - 48px); overflow: auto;
+  background: rgba(255, 255, 255, .97);
+  border: 1px solid rgba(83, 74, 183, .14);
+  border-radius: 22px; padding: 30px 30px 26px;
+  box-shadow: 0 40px 120px rgba(59, 52, 138, .35);
+  position: relative;
+  animation: am-pop .26s cubic-bezier(.34, 1.56, .64, 1);
+}
+@keyframes am-pop {
+  from { transform: scale(.94) translateY(14px); opacity: 0; }
+  to   { transform: none; opacity: 1; }
+}
+
+.am-close {
+  position: absolute; top: 14px; right: 14px;
+  width: 32px; height: 32px; border: 0; background: transparent;
+  border-radius: 10px; cursor: pointer; font-size: 17px; color: var(--ink-3);
+}
+.am-close:hover { background: var(--p-wash); color: var(--p-dark); }
+
+.am-brand { display: inline-flex; align-items: center; gap: 8px; margin-bottom: 14px; }
+.am-brand .logo-svg { animation: logo-float 3.6s ease-in-out infinite; overflow: visible; }
+.am-brand .p-back  { fill: url(#grad-back);  opacity: .72; }
+.am-brand .p-front { fill: url(#grad-front); opacity: .92; }
+.am-brand .name {
+  font-family: system-ui, sans-serif; font-size: 20px; font-weight: 500;
+  background: linear-gradient(110deg, #534AB7 0%, #9B6FD4 50%, #1D9E75 100%);
+  -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
+}
+
+.am-title {
+  font-size: 22px; font-weight: 700; letter-spacing: -0.01em;
+  margin: 6px 0 4px;
+}
+.am-subtitle {
+  color: var(--ink-3); font-size: 13.5px; margin-bottom: 20px;
+}
+
+.am-switch {
+  margin-top: 20px; padding-top: 16px;
+  border-top: 1px solid rgba(83, 74, 183, .12);
+  text-align: center; font-size: 13.5px; color: var(--ink-3);
+}
+.am-switch button {
+  background: 0; border: 0; padding: 0 0 0 4px; cursor: pointer;
+  color: var(--p-dark); font-weight: 700; font-size: inherit; font-family: inherit;
+}
+.am-switch button:hover { text-decoration: underline; }
+
+.am-alert {
+  padding: 10px 14px; border-radius: 10px; font-size: 13px; margin-bottom: 14px;
+  display: none;
+}
+.am-alert.show { display: block; }
+.am-alert.error { background: #fee2e2; color: #b91c1c; }
+.am-alert.ok    { background: var(--p-wash); color: var(--p-dark); }
+
+.am-form { display: flex; flex-direction: column; gap: 14px; }
+.am-field { display: flex; flex-direction: column; gap: 6px; }
+.am-field label { font-size: 12px; font-weight: 600; color: var(--ink-3); }
+.am-field input {
+  width: 100%; padding: 11px 14px; border: 1px solid rgba(83, 74, 183, .22);
+  border-radius: 10px; font-size: 14px; font-family: inherit;
+  background: #fff; color: var(--ink); outline: none;
+  transition: border-color .15s, box-shadow .15s;
+}
+.am-field input:focus {
+  border-color: var(--p);
+  box-shadow: 0 0 0 3px rgba(83, 74, 183, .14);
+}
+.am-field small { font-size: 11.5px; color: var(--ink-3); }
+
+.am-submit {
+  margin-top: 6px; padding: 12px 18px;
+  background: linear-gradient(135deg, #534AB7 0%, #3B348A 60%, #7B5FC0 100%);
+  color: #fff; border: 0; border-radius: 11px;
+  font-size: 14.5px; font-weight: 700; cursor: pointer;
+  box-shadow: 0 8px 20px rgba(83, 74, 183, .30);
+  transition: transform .12s, box-shadow .2s;
+}
+.am-submit:hover { transform: translateY(-1px); box-shadow: 0 12px 28px rgba(83, 74, 183, .40); }
+.am-submit:disabled { opacity: .65; cursor: not-allowed; transform: none; }
+
+.am-link {
+  background: 0; border: 0; padding: 0; cursor: pointer;
+  color: var(--p-dark); font-weight: 600; font-size: 13px; font-family: inherit;
+  align-self: flex-end;
+}
+.am-link:hover { text-decoration: underline; }
+
+.am-divider {
+  display: flex; align-items: center; gap: 10px;
+  margin: 18px 0 12px; color: var(--ink-3); font-size: 12px;
+}
+.am-divider::before, .am-divider::after {
+  content: ''; flex: 1; height: 1px; background: rgba(83, 74, 183, .15);
+}
+
+.am-social { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.am-social button {
+  padding: 9px 6px; border: 1px solid rgba(83, 74, 183, .18); border-radius: 10px;
+  background: #fff; cursor: pointer; font-size: 12.5px; font-weight: 600; color: var(--ink-2);
+}
+.am-social button[disabled] { opacity: .5; cursor: not-allowed; }
+.am-social button:not([disabled]):hover { border-color: var(--p); background: var(--p-wash); }
+
+/* ── Reveal on scroll ───────────────────────────────────────────────── */
+.reveal { opacity: 0; transform: translateY(24px); transition: opacity .7s ease, transform .7s ease; }
+.reveal.in { opacity: 1; transform: none; }
+
+/* ── Mobile ─────────────────────────────────────────────────────────── */
+@media (max-width: 880px) {
+  .hero { grid-template-columns: 1fr; gap: 30px; padding: 60px 22px 60px; }
+  .hero-visual { min-height: 380px; }
+  .stats { grid-template-columns: repeat(2, 1fr); }
+  .feature-grid { grid-template-columns: repeat(2, 1fr); }
+  .workflow { grid-template-columns: repeat(2, 1fr); gap: 36px 18px; }
+  .workflow::before { display: none; }
+  .cta-banner { padding: 44px 32px; margin: 30px 22px 60px; }
+  .nav-inner { padding: 10px 18px; }
+  .nav-link { display: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+  .reveal { opacity: 1; transform: none; }
+}
+</style>
+</head>
+<body>
+
+<!-- Shared SVG defs for the dynamic paipai logo -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <linearGradient id="grad-back" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%"   stop-color="#AFA9EC"/>
+      <stop offset="100%" stop-color="#9B6FD4"/>
+    </linearGradient>
+    <linearGradient id="grad-front" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%"   stop-color="#534AB7"/>
+      <stop offset="60%"  stop-color="#7B5FC0"/>
+      <stop offset="100%" stop-color="#1D9E75"/>
+    </linearGradient>
+  </defs>
+</svg>
+
+<div class="bg-canvas"></div>
+<div class="bg-grid"></div>
+<div class="orb o1"></div>
+<div class="orb o2"></div>
+<div class="orb o3"></div>
+
+<!-- ── Nav ────────────────────────────────────────────────────────── -->
+<nav class="nav">
+  <div class="nav-inner">
+    <a class="brand" href="/" aria-label="paipai home">
+      <svg class="logo-svg" width="42" height="42" viewBox="0 0 68 68" xmlns="http://www.w3.org/2000/svg">
+        <text class="p-back"  x="4"  y="54">p</text>
+        <text class="p-front" x="22" y="46">p</text>
+      </svg>
+      <span class="wordmark">paipai</span>
+    </a>
+    <div class="nav-links">
+      <a class="nav-link" href="#features">能力</a>
+      <a class="nav-link" href="#flow">流程</a>
+      <button class="nav-link" type="button" data-when="logged-out" onclick="openAuthModal('login')">登录</button>
+      <button class="nav-cta"  type="button" data-when="logged-out" onclick="openAuthModal('register')">免费开始 →</button>
+      <a class="nav-cta" href="/app" data-when="logged-in" style="display:none">进入应用 →</a>
+    </div>
+  </div>
+</nav>
+
+<!-- ── Hero ──────────────────────────────────────────────────────── -->
+<section class="hero">
+  <div class="reveal">
+    <div class="hero-eyebrow">
+      <span class="pulse"></span>
+      <span>AI 驱动 · 为科研而生</span>
+    </div>
+    <h1>
+      让科研工作<br>
+      <span class="grad">回归思考本身</span>
+    </h1>
+    <p class="lead">
+      一个站点搞定文献检索、深度阅读、笔记沉淀和论文写作。<br>
+      让 AI 帮你处理重复劳动，把时间还给真正重要的研究。
+    </p>
+    <div class="cta-row">
+      <button class="btn btn-primary" type="button" data-when="logged-out" onclick="openAuthModal('register')">免费创建账号 →</button>
+      <button class="btn btn-ghost"   type="button" data-when="logged-out" onclick="openAuthModal('login')">已有账号，登录</button>
+      <a class="btn btn-primary" href="/app" data-when="logged-in" style="display:none">进入应用 →</a>
+    </div>
+  </div>
+
+  <div class="hero-visual reveal">
+    <div class="hero-rings">
+      <div class="ring r1"></div>
+      <div class="ring r2"></div>
+    </div>
+    <div class="hero-card c1">
+      <div class="card-h"><div class="card-i">🔍</div>正在检索文献</div>
+      <div class="card-b">arXiv · Semantic Scholar · 已找到 24 篇相关论文</div>
+    </div>
+    <div class="hero-card c2">
+      <div class="card-h"><div class="card-i">📄</div>正在阅读 PDF</div>
+      <div class="card-b">"Attention Is All You Need" · 已生成 3 条要点</div>
+    </div>
+    <div class="hero-card c3">
+      <div class="card-h"><div class="card-i">✍️</div>正在生成摘要</div>
+      <div class="card-b">基于 12 篇文献，自动归纳研究脉络与方法对比</div>
+    </div>
+  </div>
+</section>
+
+<!-- ── Stats ─────────────────────────────────────────────────────── -->
+<div class="stats">
+  <div class="stat reveal"><div class="stat-num">200M+</div><div class="stat-lbl">可检索学术文献</div></div>
+  <div class="stat reveal"><div class="stat-num">8</div><div class="stat-lbl">智能 Agent 协同</div></div>
+  <div class="stat reveal"><div class="stat-num">10×</div><div class="stat-lbl">阅读效率提升</div></div>
+  <div class="stat reveal"><div class="stat-num">7×24</div><div class="stat-lbl">不打烊的研究伙伴</div></div>
+</div>
+
+<!-- ── Features ──────────────────────────────────────────────────── -->
+<section id="features" class="section">
+  <div class="section-head reveal">
+    <span class="section-tag">CORE FEATURES</span>
+    <h2>四个核心能力 · <span class="grad">一站式覆盖科研全流程</span></h2>
+    <p class="lead">从你想到一个研究问题开始，到产出一篇论文为止，paipai 都在。</p>
+  </div>
+
+  <div class="feature-grid">
+    <div class="feature reveal">
+      <div class="feature-ico">📚</div>
+      <h3>智能文献检索</h3>
+      <p>整合 arXiv、Semantic Scholar 等多个学术源，自然语言一句话即可定位关键论文。</p>
+    </div>
+    <div class="feature reveal">
+      <div class="feature-ico">📄</div>
+      <h3>深度文献阅读</h3>
+      <p>PDF 与 PPT 直接问答，自动定位引用、抽取图表，理解原文不再靠死磕。</p>
+    </div>
+    <div class="feature reveal">
+      <div class="feature-ico">📝</div>
+      <h3>结构化笔记</h3>
+      <p>对话即笔记，自动归类与索引；跨论文知识点串联，沉淀属于你自己的研究图谱。</p>
+    </div>
+    <div class="feature reveal">
+      <div class="feature-ico">✍️</div>
+      <h3>AI 写作助手</h3>
+      <p>从开题报告到论文初稿，按学术规范生成结构与措辞，引用自动归位。</p>
+    </div>
+  </div>
+</section>
+
+<!-- ── Workflow ──────────────────────────────────────────────────── -->
+<section id="flow" class="section" style="padding-top: 40px;">
+  <div class="section-head reveal">
+    <span class="section-tag">HOW IT WORKS</span>
+    <h2>工作流 · <span class="grad">问、查、读、写</span></h2>
+    <p class="lead">把研究的四个环节交给一个统一的 Agent 团队，无缝衔接。</p>
+  </div>
+
+  <div class="workflow">
+    <div class="step reveal"><div class="step-num">1</div><h4>提问</h4><p>用自然语言描述你的研究问题</p></div>
+    <div class="step reveal"><div class="step-num">2</div><h4>检索</h4><p>跨数据源自动找到相关文献</p></div>
+    <div class="step reveal"><div class="step-num">3</div><h4>阅读</h4><p>深度解析每篇 PDF 并生成笔记</p></div>
+    <div class="step reveal"><div class="step-num">4</div><h4>写作</h4><p>结构化输出报告或论文段落</p></div>
+  </div>
+</section>
+
+<!-- ── CTA Banner ────────────────────────────────────────────────── -->
+<section class="cta-banner reveal">
+  <h2>把一个 AI 研究团队 · 装进浏览器</h2>
+  <p>无需配置 API、无需切换工具，注册即可开始你的下一个课题。</p>
+  <div class="cta-row">
+    <button class="btn btn-primary" type="button" data-when="logged-out" onclick="openAuthModal('register')">立即免费开始 →</button>
+    <button class="btn btn-ghost"   type="button" data-when="logged-out" onclick="openAuthModal('login')">登录我的账号</button>
+    <a class="btn btn-primary" href="/app" data-when="logged-in" style="display:none">进入应用 →</a>
+  </div>
+</section>
+
+<!-- ── Footer ────────────────────────────────────────────────────── -->
+<footer>
+  <div class="foot-inner">
+    <div>© 2026 paipai · 一个为研究者打造的智能助手</div>
+    <div style="display:flex;gap:18px">
+      <button type="button" class="am-link" style="font-weight:400;color:var(--ink-2)" onclick="openAuthModal('login')">登录</button>
+      <button type="button" class="am-link" style="font-weight:400;color:var(--ink-2)" onclick="openAuthModal('register')">注册</button>
+      <a href="#features">能力</a>
+    </div>
+  </div>
+</footer>
+
+<!-- ── Inline auth modal — login / register without leaving the landing ── -->
+<div id="am-overlay" class="am-overlay" onclick="if (event.target === this) closeAuthModal()">
+  <div class="am-card" role="dialog" aria-label="账号登录">
+    <button class="am-close" onclick="closeAuthModal()" aria-label="关闭">✕</button>
+
+    <div class="am-brand">
+      <svg class="logo-svg" width="34" height="34" viewBox="0 0 68 68">
+        <text class="p-back"  x="4"  y="54" style="font-family:system-ui;font-size:52px;font-weight:600;transform-origin:20px 44px">p</text>
+        <text class="p-front" x="22" y="46" style="font-family:system-ui;font-size:52px;font-weight:600;transform-origin:38px 38px">p</text>
+      </svg>
+      <span class="name">paipai</span>
+    </div>
+
+    <!-- LOGIN VIEW ─────────────────────────────────────────── -->
+    <div id="am-view-login">
+      <h2 class="am-title">欢迎回来</h2>
+      <p class="am-subtitle">登录后继续你的研究工作</p>
+
+      <div id="am-alert-login" class="am-alert"></div>
+
+      <form id="am-login" class="am-form" onsubmit="return submitLogin(event)">
+        <div class="am-field">
+          <label for="am-email">邮箱</label>
+          <input id="am-email" type="email" autocomplete="email" required>
+        </div>
+        <div class="am-field">
+          <label for="am-password">密码</label>
+          <input id="am-password" type="password" autocomplete="current-password" minlength="8" required>
+        </div>
+        <button id="am-login-btn" class="am-submit" type="submit">登录</button>
+        <button type="button" class="am-link" onclick="submitForgot()">忘记密码？</button>
+      </form>
+
+      <div class="am-divider">第三方登录（即将上线）</div>
+      <div class="am-social">
+        <button type="button" disabled title="PR-3">QQ</button>
+        <button type="button" disabled>微信</button>
+        <button type="button" disabled title="PR-2">手机</button>
+      </div>
+
+      <div class="am-switch">
+        还没有账号？<button type="button" onclick="switchAuthTab('register')">立即注册</button>
+      </div>
+    </div>
+
+    <!-- REGISTER VIEW ──────────────────────────────────────── -->
+    <div id="am-view-register" hidden>
+      <h2 class="am-title">创建账号</h2>
+      <p class="am-subtitle">注册后我们会发激活邮件到你的邮箱</p>
+
+      <div id="am-alert-register" class="am-alert"></div>
+
+      <form id="am-register" class="am-form" onsubmit="return submitRegister(event)">
+        <div class="am-field">
+          <label for="am-name">昵称</label>
+          <input id="am-name" type="text" minlength="1" maxlength="64" required>
+        </div>
+        <div class="am-field">
+          <label for="am-email2">邮箱</label>
+          <input id="am-email2" type="email" autocomplete="email" required>
+        </div>
+        <div class="am-field">
+          <label for="am-password2">密码</label>
+          <input id="am-password2" type="password" autocomplete="new-password" minlength="8" maxlength="128" required>
+          <small>至少 8 位</small>
+        </div>
+        <div class="am-field">
+          <label for="am-confirm">确认密码</label>
+          <input id="am-confirm" type="password" autocomplete="new-password" minlength="8" required>
+        </div>
+        <button id="am-register-btn" class="am-submit" type="submit">创建账号</button>
+      </form>
+
+      <div class="am-switch">
+        已有账号？<button type="button" onclick="switchAuthTab('login')">直接登录</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// Reveal-on-scroll
+const io = new IntersectionObserver((entries) => {
+  entries.forEach(e => { if (e.isIntersecting) { e.target.classList.add('in'); io.unobserve(e.target); }});
+}, { threshold: 0.12, rootMargin: '0px 0px -8% 0px' });
+document.querySelectorAll('.reveal').forEach(el => io.observe(el));
+
+// If already logged in, swap "免费开始 / 登录" for "进入应用"
+let __loggedIn = false;
+(async () => {
+  try {
+    const r = await fetch('/api/me', { credentials: 'include' });
+    if (!r.ok) return;
+    const data = await r.json();
+    if (!data.user) return;
+    __loggedIn = true;
+    document.querySelectorAll('[data-when="logged-out"]').forEach(el => el.style.display = 'none');
+    document.querySelectorAll('[data-when="logged-in"]').forEach(el => el.style.display = '');
+  } catch(_){}
+})();
+
+// ── Auth modal ──────────────────────────────────────────────────────────
+const AM = document.getElementById('am-overlay');
+
+let __authMode = 'login';
+
+function openAuthModal(mode = 'login') {
+  if (__loggedIn) { location.assign('/app'); return; }
+  AM.classList.add('open');
+  switchAuthTab(mode);
+  document.body.style.overflow = 'hidden';
+  setTimeout(() => {
+    const f = mode === 'login' ? '#am-email' : '#am-name';
+    document.querySelector(f)?.focus();
+  }, 80);
+}
+
+function closeAuthModal() {
+  AM.classList.remove('open');
+  document.body.style.overflow = '';
+  authClearAlert();
+}
+
+function switchAuthTab(mode) {
+  __authMode = mode;
+  document.getElementById('am-view-login').hidden    = (mode !== 'login');
+  document.getElementById('am-view-register').hidden = (mode !== 'register');
+  authClearAlert();
+  // Re-focus the first input of the active view so the user can start typing immediately
+  setTimeout(() => {
+    const f = mode === 'login' ? '#am-email' : '#am-name';
+    document.querySelector(f)?.focus();
+  }, 60);
+}
+
+function authAlert(msg, type = 'error') {
+  const id = __authMode === 'register' ? 'am-alert-register' : 'am-alert-login';
+  const el = document.getElementById(id);
+  el.className = 'am-alert show ' + type;
+  el.textContent = msg;
+}
+function authClearAlert() {
+  document.getElementById('am-alert-login').className = 'am-alert';
+  document.getElementById('am-alert-register').className = 'am-alert';
+}
+
+async function submitLogin(e) {
+  e.preventDefault();
+  authClearAlert();
+  const btn = document.getElementById('am-login-btn');
+  btn.disabled = true; btn.textContent = '登录中…';
+  try {
+    const email = document.getElementById('am-email').value.trim();
+    const password = document.getElementById('am-password').value;
+    const r = await fetch('/api/auth/email/login', {
+      method: 'POST', credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password }),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      authAlert(data?.detail?.message || data?.message || '登录失败');
+      return;
+    }
+    location.assign('/app');
+  } catch (err) {
+    authAlert('网络错误，请重试');
+  } finally {
+    btn.disabled = false; btn.textContent = '登录';
+  }
+  return false;
+}
+
+async function submitRegister(e) {
+  e.preventDefault();
+  authClearAlert();
+  const display_name = document.getElementById('am-name').value.trim();
+  const email = document.getElementById('am-email2').value.trim();
+  const password = document.getElementById('am-password2').value;
+  const confirm  = document.getElementById('am-confirm').value;
+  if (password !== confirm) { authAlert('两次输入的密码不一致'); return false; }
+  const btn = document.getElementById('am-register-btn');
+  btn.disabled = true; btn.textContent = '提交中…';
+  try {
+    const r = await fetch('/api/auth/email/register', {
+      method: 'POST', credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password, display_name }),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      authAlert(data?.detail?.message || data?.message || '注册失败');
+      return;
+    }
+    authAlert(data.message || '激活邮件已发送，请到邮箱查收', 'ok');
+  } catch (err) {
+    authAlert('网络错误，请重试');
+  } finally {
+    btn.disabled = false; btn.textContent = '创建账号';
+  }
+  return false;
+}
+
+async function submitForgot() {
+  const email = (document.getElementById('am-email').value || '').trim();
+  if (!email) { authAlert('请先输入邮箱'); return; }
+  authClearAlert();
+  try {
+    const r = await fetch('/api/auth/email/forgot', {
+      method: 'POST', credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email }),
+    });
+    const data = await r.json().catch(() => ({}));
+    // FastAPI wraps HTTP errors in {detail: {...}}, success returns top-level
+    const msg = (data && (data.detail?.message || data.message)) ||
+                (r.ok ? '如果邮箱已注册，重置链接已发送' : '请求失败');
+    authAlert(msg, r.ok ? 'ok' : 'error');
+  } catch (_) {
+    authAlert('网络错误，请重试');
+  }
+}
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && AM.classList.contains('open')) closeAuthModal();
+});
+
+// Open modal automatically on #login or #register hash links
+if (location.hash === '#login')    openAuthModal('login');
+if (location.hash === '#register') openAuthModal('register');
+</script>
+</body>
+</html>

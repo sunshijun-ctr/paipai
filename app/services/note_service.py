@@ -259,6 +259,9 @@ class NoteService:
             logger.warning("Failed to remove note from knowledge base: %s", exc)
 
     def _migrate_json_to_postgres(self) -> None:
+        """One-time import from the legacy JSON file. After a successful run we
+        rename the JSON to `.migrated` so a note the user deleted in PG never
+        gets re-created on the next startup."""
         if not self._repo or not os.path.exists(self._path):
             return
         try:
@@ -272,8 +275,19 @@ class NoteService:
                 except KeyError:
                     self._repo.create(note)
                     migrated += 1
-            if migrated:
-                logger.info("Migrated %d JSON note(s) to PostgreSQL", migrated)
+            # Mark the JSON as consumed regardless of how many rows were copied
+            # over — this is what stops "deleted notes keep coming back".
+            archived = self._path + ".migrated"
+            try:
+                if os.path.exists(archived):
+                    os.remove(archived)
+                os.rename(self._path, archived)
+                logger.info(
+                    "Migrated %d JSON note(s) to PostgreSQL; archived %s → %s",
+                    migrated, self._path, archived,
+                )
+            except OSError as exc:
+                logger.warning("Could not archive notes.json after migration: %s", exc)
         except Exception as exc:
             logger.warning("JSON note migration skipped: %s", exc)
 

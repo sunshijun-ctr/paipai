@@ -22,6 +22,7 @@ class ShortTermMemoryStore:
         self._path = os.path.join(_SESSIONS_DIR, f"{session_id}.json")
         self._data: dict[str, Any] = {
             "session_id": session_id,
+            "owner_user_id": "",      # user.id of the owner — empty for legacy until claimed
             "recent_turns": [],       # last N raw conversation messages
             "history_summary": "",    # compressed summary of older turns
             "current_task": "",       # latest unfinished or follow-up user intent
@@ -36,6 +37,16 @@ class ShortTermMemoryStore:
             "updated_at": "",
         }
         self.load()
+
+    # ── Ownership ─────────────────────────────────────────────────────────────
+
+    @property
+    def owner_user_id(self) -> str:
+        return self._data.get("owner_user_id", "") or ""
+
+    @owner_user_id.setter
+    def owner_user_id(self, value: str) -> None:
+        self._data["owner_user_id"] = value or ""
 
     # ── Persistence ───────────────────────────────────────────────────────────
 

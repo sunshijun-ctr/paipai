@@ -144,6 +144,7 @@ class LiteratureAgent(BaseAgent):
             selected_normalized = [_normalize_for_download(p) for p in selected]
             download_result = await ToolRegistry.get("download_pdf").execute(papers=selected_normalized)
             downloaded: list[dict[str, Any]] = download_result.data.get("downloaded_pdfs", [])
+            failed: list[dict[str, Any]] = download_result.data.get("failed", [])
         except KeyError as exc:
             return self._error_output(agent_input, f"Tool not registered: {exc}")
         except Exception as exc:
@@ -156,17 +157,37 @@ class LiteratureAgent(BaseAgent):
         state.tool_results["literature_download"] = download_result.data
         state.update_stage("literature_done", self.name)
 
+        if downloaded:
+            reply_lines = [f"已成功下载 **{len(downloaded)}** 篇论文，现在可以继续提问或下载其他文章。"]
+            if failed:
+                reply_lines.append("")
+                reply_lines.append(f"其中有 **{len(failed)}** 篇下载失败：")
+                for item in failed[:5]:
+                    reply_lines.append(f"- {item.get('title', 'Untitled')}：{item.get('error', 'unknown error')}")
+            reply = "\n".join(reply_lines)
+            status = AgentStatus.SUCCESS if not failed else AgentStatus.PARTIAL_SUCCESS
+        else:
+            reply_lines = ["当前没有成功下载任何论文。你可以重试下载，或改选其他文章。"]
+            if failed:
+                reply_lines.append("")
+                reply_lines.append(f"失败详情（共 {len(failed)} 篇）：")
+                for item in failed[:5]:
+                    reply_lines.append(f"- {item.get('title', 'Untitled')}：{item.get('error', 'unknown error')}")
+            reply = "\n".join(reply_lines)
+            status = AgentStatus.PARTIAL_SUCCESS if failed else AgentStatus.FAILED
+
         return AgentOutput(
             task_id=agent_input.task_id,
             session_id=agent_input.session_id,
             agent_name=self.name,
-            status=AgentStatus.SUCCESS,
+            status=status,
             result={
                 "total_found": len(papers),
                 "query": query,
                 "source_counts": search_meta.get("source_counts", {}) if not pre_selected else {},
                 "papers": papers,
                 "selected_papers": selected,
+                "reply": reply,
             },
             artifacts={"downloaded_pdfs": downloaded},
             next_suggestion="dispatch_to_reading_agent",

@@ -414,7 +414,15 @@ def _extract_pptx_file(local_path: str) -> dict[str, Any]:
 
 
 def extract_any(local_path: str) -> dict[str, Any]:
-    """Dispatch to the right extractor based on file extension."""
+    """Dispatch to the right extractor based on file extension.
+
+    PDFs go through LlamaParse first when configured. We fall back to
+    PyMuPDF when LlamaParse either raises OR returns empty content
+    (the latter happens on quota exhaustion, server-side parse errors,
+    or oversized files — none of which raise on the client). Without
+    the empty-result check, large PDFs silently land in the library
+    with 0 chunks indexed.
+    """
     ext = os.path.splitext(local_path)[1].lower()
     if ext in _TEXT_EXTS:
         return _extract_text_file(local_path)
@@ -423,7 +431,38 @@ def extract_any(local_path: str) -> dict[str, Any]:
     from app.config.settings import settings
     if settings.use_llama_parse:
         try:
-            return extract_llama_index(local_path)
+            data = extract_llama_index(local_path)
+            if _has_content(data):
+                logger.info("PDF extracted via LlamaParse: %s", os.path.basename(local_path))
+                return data
+            logger.warning(
+                "LlamaParse returned empty for '%s' — falling back to PyMuPDF "
+                "(likely quota / size / upstream parse error)",
+                os.path.basename(local_path),
+            )
         except Exception as exc:
-            logger.warning("LlamaParse extraction failed, falling back to PyMuPDF: %s", exc)
-    return extract(local_path)
+            logger.warning(
+                "LlamaParse extraction failed for '%s' (%s) — falling back to PyMuPDF",
+                os.path.basename(local_path), exc,
+            )
+    result = extract(local_path)
+    logger.info(
+        "PDF extracted via PyMuPDF: %s (%d chars, %d sections, %d chunks)",
+        os.path.basename(local_path),
+        len(result.get("full_text") or ""),
+        len(result.get("sections") or {}),
+        len(result.get("rag_chunks") or []),
+    )
+    return result
+
+
+def _has_content(data: dict[str, Any]) -> bool:
+    """A non-empty extraction has at least one of: full_text, any section,
+    or any rag_chunk. Empty across all three means the extractor produced
+    nothing usable."""
+    if (data.get("full_text") or "").strip():
+        return True
+    sections = data.get("sections") or {}
+    if any((v or "").strip() for v in sections.values()):
+        return True
+    return bool(data.get("rag_chunks"))

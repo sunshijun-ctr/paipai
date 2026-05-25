@@ -35,43 +35,62 @@ Return strict JSON only:
 }
 
 Available workflows:
-1. paper_search_workflow: search/find papers, including requests that may later download papers.
+1. paper_search_workflow: single-shot paper search — user wants a list of papers, will choose what to do next themselves. Picks 3–10 results and stops.
 2. conversation_summary_workflow: summarize or organize the current conversation/session.
-3. question_answer_workflow: answer questions about uploaded files, papers, the literature library, or knowledge base.
-4. image_understanding_workflow: analyze an uploaded image and answer questions about it.
-5. library_ingest_workflow: add uploaded/downloaded/local files into the literature library/knowledge base.
-6. academic_writing_workflow: academic writing transformation, including expanding, polishing, supplementing, paraphrasing, semantic rewriting, style imitation, literature-style writing, or writing from user input/uploads/library.
-7. kb_writing_workflow: legacy alias for writing based on knowledge base.
-8. uploaded_file_writing_workflow: legacy alias for writing based on uploaded files.
-9. note_workflow: create, save, update, delete, search, list, organize, or embed notes.
-10. chat_workflow: lightweight ordinary conversation or clarification.
-11. general_agent_workflow: open-ended tasks handled by a Plan-and-Action General Agent.
+3. question_answer_workflow: answer a SPECIFIC question grounded in uploaded files, papers, or the knowledge base. Returns one answer; not multi-step research.
+4. web_search_workflow: ONE focused web question. Use only when the answer is most likely on the public web AND a single search + read is enough.
+   - Example: "查一下 OpenAI 最新发布会的日期" — narrow, factual, single-shot.
+   - DO NOT use for "调研/综述/现状/最新进展" of a research topic — those go to research_agent_workflow.
+5. image_understanding_workflow: analyze an uploaded image and answer questions about it.
+6. library_ingest_action: add uploaded/downloaded/local files into the literature library/knowledge base.
+7. academic_writing_workflow: academic writing — generate, expand, polish, supplement, paraphrase, rewrite, imitate style, or compose from any combination of user-typed input, uploaded files, and library retrieval. The workflow itself decides which source(s) to use.
+8. note_action: create, save, update, delete, search, list, organize, or embed notes.
+9. general_agent_workflow: open conversation, advice, opinions, plain Q&A that needs no tools, lightweight chat, and clarification.
+10. research_agent_workflow: ⭐ MULTI-STEP RESEARCH. The agent picks and chains tools on its own (paper_search → web_search → web_fetch → note_create → ...). Choose this whenever the user asks to "research / 调研 / 综述 / 了解一下 / 现状 / 进展 / 发展 / 最新研究 / state of the art" of a topic, or when fulfilling the request clearly needs MORE THAN ONE retrieval step.
+   - This is your DEFAULT for any "deep dive" / "landscape" / "what's been done in X" question.
+   - Prefer this over web_search_workflow when the user wants a synthesised landscape rather than one specific fact.
+   - Prefer this over paper_search_workflow when the user wants UNDERSTANDING of the topic, not just a paper list.
+   - Prefer this over general_agent_workflow when the question needs fresh external data (papers, web).
 
 Routing rules:
 - Return route="workflow_task" only when a workflow fully covers the user's goal, required inputs are present, and execution should start immediately.
 - Return route="open_task" when the request is open-ended, mixed, exploratory, advisory, architectural, research-design oriented, or not fully covered by one workflow.
 - Return route="clarify" when the target is too vague and execution would be risky.
-- If no workflow fully covers the request, do not choose the closest workflow. Use route="open_task", workflow="general_agent_workflow", intent="general_open_task".
-- Workflows are tools. Open mixed tasks should go to the General Agent, which may use workflows as subtasks.
-- Comparing, contrasting, differentiating, evaluating pros/cons, or synthesizing differences across multiple papers is an open task.
-  Even if the papers are in the knowledge base, use route="open_task" and workflow="general_agent_workflow";
-  retrieval/reading can be used later as subtasks.
+- "调研/综述/现状/进展/landscape of X" questions → research_agent_workflow (not web_search, not paper_search).
+- Comparing / contrasting MULTIPLE papers or methods, especially when the user hasn't pre-loaded them → research_agent_workflow.
+- Comparing two already-uploaded specific files where no external retrieval is needed → general_agent_workflow.
+- Lightweight conversation, greetings, opinions → general_agent_workflow.
 
 Important:
 - If the message contains IMAGE_PATH=, choose image_understanding_workflow.
-- If the message contains WRITING_SOURCE=library, choose kb_writing_workflow.
-- If the message contains WRITING_SOURCE=upload or WRITING_SOURCE=rewrite, choose uploaded_file_writing_workflow.
-- If the message contains ACADEMIC_WRITING=1, choose academic_writing_workflow.
+- If the message contains ACADEMIC_WRITING=1, or WRITING_SOURCE=library / WRITING_SOURCE=upload / WRITING_SOURCE=rewrite — choose academic_writing_workflow (it picks the source internally).
 - For requests to expand, polish, supplement, paraphrase, semantically rewrite, imitate style, or generate academic text, choose academic_writing_workflow.
 - The question_answer_workflow itself decides uploaded-file versus library source.
 - For unclear requests, set route="clarify", need_clarification=true, and ask one short clarification question.
 
-Open task examples:
-- "这个研究方向怎么做比较好?"
-- "帮我设计一个更灵活的 agent 架构"
+Examples (workflow → user request):
+
+research_agent_workflow (multi-step research; THIS IS THE DEFAULT for "调研/综述/现状"):
+- "调研一下 LLM evaluation 的研究现状"
+- "了解一下 RAG 在医疗领域的最新进展"
+- "帮我看看 attention 机制的发展脉络"
+- "找几篇 transformer 论文，下载 top 3，做成笔记"
+- "compare 5 LLM benchmark papers and tell me what's missing"
+
+web_search_workflow (ONE specific fact from the web):
+- "OpenAI o3 的发布时间是?"
+- "查一下 NeurIPS 2025 的截稿日期"
+- "GPT-4 的训练数据规模是?"
+
+paper_search_workflow (user wants a list of papers and will pick from it):
+- "搜几篇 mamba 的论文"
+- "找 5 篇 RAG 综述"
+
+general_agent_workflow (no external data needed):
 - "这个 idea 靠谱吗?"
-- "帮我设计研究方案，顺便找几篇论文支撑"
+- "帮我设计一个更灵活的 agent 架构"
 - "这段代码为什么看起来怪?"
+- "你好" / 闲聊
 """
 
 LAST_WORKFLOW_OUTPUT_TOKEN_LIMIT = 500
@@ -96,7 +115,7 @@ class IntentAgent(BaseAgent):
             )
         except Exception as exc:
             logger.warning("IntentAgent LLM call failed (%s), using fallback workflow.", exc)
-            raw_result = _fallback_intent(raw_query)
+            raw_result = _fallback_intent(raw_query, session_context=session_context)
 
         result = _normalize_route_result(normalize_workflow_intent(raw_result))
         result.update(_derived_legacy_fields(raw_query, result))
@@ -110,7 +129,7 @@ class IntentAgent(BaseAgent):
             agent_name=self.name,
             status=AgentStatus.SUCCESS,
             result=result,
-            next_suggestion=f"dispatch_to_{result.get('workflow', 'chat_workflow')}",
+            next_suggestion=f"dispatch_to_{result.get('workflow', 'general_agent_workflow')}",
         )
 
 
@@ -150,9 +169,33 @@ def _limit_by_token_estimate(text: str, token_limit: int) -> str:
     return content[:char_limit].rstrip()
 
 
-def _fallback_intent(query: str) -> dict[str, Any]:
+_PRIOR_WORKFLOW_TO_INTENT = {
+    "academic_writing_workflow": "paper_writing",
+    "paper_search_workflow": "paper_search",
+    "question_answer_workflow": "question_answer",
+    "library_ingest_action": "library_ingest",
+    "note_action": "note",
+    "conversation_summary_workflow": "conversation_summary",
+    "image_understanding_workflow": "image_understanding",
+    "web_search_workflow": "web_search",
+    "general_agent_workflow": "general_open_task",
+    "research_agent_workflow": "research_task",
+}
+
+
+def _fallback_intent(query: str, *, session_context: "SessionContext | None" = None) -> dict[str, Any]:
+    """Pure-keyword fallback used only when the Intent LLM errors out.
+
+    Previously this ignored all session context, so an LLM hiccup mid-task
+    would drop the user into chat_workflow / open_task and forget the prior
+    workflow. We now check if there's an active task and resume its workflow
+    UNLESS the new message clearly switches to a different mode (image,
+    explicit writing markers, etc.) — those overrides still win because they
+    indicate a deliberate switch."""
     q = query.lower()
     source = _extract_writing_source(query)
+
+    # Hard overrides — these markers are explicit instructions, always honor them
     if "image_path=" in q:
         return _workflow("image_understanding", "image_understanding_workflow", "uploaded image needs analysis")
     if "academic_writing=1" in q:
@@ -161,10 +204,20 @@ def _fallback_intent(query: str) -> dict[str, Any]:
         return _workflow("paper_writing", "academic_writing_workflow", "explicit library writing source")
     if source in {"upload", "rewrite"}:
         return _workflow("paper_writing", "academic_writing_workflow", "explicit upload/rewrite writing source")
+
+    # NEW: if there's an active prior task and the new message is a short
+    # follow-up that doesn't clearly switch context, resume the prior workflow.
+    prior = _prior_workflow_from_context(session_context)
+    if prior and _looks_like_continuation(q):
+        prior_intent = _PRIOR_WORKFLOW_TO_INTENT.get(prior, "")
+        if prior_intent:
+            return _workflow(prior_intent, prior,
+                             f"fallback continuing prior task ({prior})", confidence=0.6)
+
     if _looks_like_library_ingest(q):
-        return _workflow("library_ingest", "library_ingest_workflow", "user wants to store material in library")
+        return _workflow("library_ingest", "library_ingest_action", "user wants to store material in library")
     if _looks_like_note_task(q):
-        return _workflow("note", "note_workflow", "note operation")
+        return _workflow("note", "note_action", "note operation")
     if _looks_like_summary_task(q):
         return _workflow("conversation_summary", "conversation_summary_workflow", "conversation summary")
     if _looks_like_writing_task(q):
@@ -179,9 +232,45 @@ def _fallback_intent(query: str) -> dict[str, Any]:
         return _workflow("paper_search", "paper_search_workflow", "paper search/download/reading request")
     if _looks_like_qa(q) and (_looks_like_upload_reference(q) or _looks_like_library_reference(q)):
         return _workflow("question_answer", "question_answer_workflow", "question about papers/files/library")
+
+    # No clear signal — if we still have a prior workflow, prefer that over chat.
+    if prior:
+        prior_intent = _PRIOR_WORKFLOW_TO_INTENT.get(prior, "")
+        if prior_intent:
+            return _workflow(prior_intent, prior,
+                             f"fallback resuming active task ({prior})", confidence=0.55)
+
     if _looks_like_light_chat(q):
-        return _workflow("chat", "chat_workflow", "lightweight conversation")
+        # chat_workflow was merged into general_agent_workflow.
+        return _open_task("lightweight conversation handled by general agent", confidence=0.7)
     return _open_task("open-ended request; use plan-and-action general agent")
+
+
+def _prior_workflow_from_context(ctx: "SessionContext | None") -> str:
+    """Best-effort recovery of the most recently active workflow."""
+    if ctx is None:
+        return ""
+    task = getattr(ctx, "current_task", "") or ""
+    # current_task often stored as a free-text label; look for the workflow id
+    for wf in _PRIOR_WORKFLOW_TO_INTENT:
+        if wf in task:
+            return wf
+    last_output = getattr(ctx, "last_workflow_output", "") or ""
+    for wf in _PRIOR_WORKFLOW_TO_INTENT:
+        if wf in last_output[:200]:
+            return wf
+    return ""
+
+
+def _looks_like_continuation(q: str) -> bool:
+    """Heuristic: a short follow-up or pronoun reference probably continues
+    the prior task. Conservative — only trips on obvious signals."""
+    if not q.strip():
+        return False
+    if len(q) <= 20:
+        return True
+    pronoun_markers = ("它", "他", "她", "这个", "那个", "刚才", "上面", "下载第", "第", "再来", "继续")
+    return any(m in q for m in pronoun_markers)
 
 
 def _workflow(intent: str, workflow: str, reason: str, confidence: float = 0.72) -> dict[str, Any]:
@@ -216,25 +305,50 @@ def _normalize_route_result(result: dict[str, Any]) -> dict[str, Any]:
     intent = str(result.get("intent") or "").strip().lower()
     if result.get("need_clarification"):
         result["route"] = "clarify"
-        result["workflow"] = "chat_workflow"
-        result["user_intent"] = "general_chat"
+        result["workflow"] = "general_agent_workflow"
+        result["user_intent"] = "general_open_task"
         return result
     if intent in {"compare_papers", "paper_comparison", "compare", "contrast_papers", "synthesize_papers"}:
+        # Compare/synthesize across papers usually needs to FIND + READ them
+        # → ResearchAgent. The orchestrator may still downgrade to
+        # general_agent_workflow when the papers are already loaded.
         result["route"] = "open_task"
-        result["workflow"] = "general_agent_workflow"
-        result["intent"] = "general_open_task"
-        result["user_intent"] = "general_open_task"
-        result["suggested_agent"] = "general_agent"
+        result["workflow"] = "research_agent_workflow"
+        result["intent"] = "research_task"
+        result["user_intent"] = "research_task"
+        result["suggested_agent"] = "research_agent"
         result["reason"] = (
             str(result.get("reason") or "").strip()
-            + " Routed to General Agent because paper comparison requires synthesis, not simple QA."
+            + " Routed to ResearchAgent because paper comparison usually needs"
+            + " multi-step retrieval before synthesis."
         ).strip()
         return result
+    # Research-task intent (e.g. "调研 / 综述 / 现状") → ResearchAgent.
+    if intent in {"research_task", "research", "investigate", "literature_review",
+                  "survey", "deep_research"}:
+        result["route"] = "open_task"
+        result["workflow"] = "research_agent_workflow"
+        result["intent"] = "research_task"
+        result["user_intent"] = "research_task"
+        result["suggested_agent"] = "research_agent"
+        return result
     if route == "open_task":
-        result["workflow"] = "general_agent_workflow"
-        result["intent"] = result.get("intent") or "general_open_task"
-        result["user_intent"] = "general_open_task"
-        result["suggested_agent"] = "general_agent"
+        # Preserve research_agent_workflow if the LLM picked it explicitly.
+        if result.get("workflow") == "research_agent_workflow":
+            result["intent"] = result.get("intent") or "research_task"
+            result["user_intent"] = "research_task"
+            result["suggested_agent"] = "research_agent"
+        else:
+            result["workflow"] = result.get("workflow") or "general_agent_workflow"
+            result["intent"] = result.get("intent") or "general_open_task"
+            result["user_intent"] = "general_open_task"
+            result["suggested_agent"] = "general_agent"
+        return result
+    if workflow == "research_agent_workflow":
+        result["route"] = "open_task"
+        result["intent"] = result.get("intent") or "research_task"
+        result["user_intent"] = "research_task"
+        result["suggested_agent"] = "research_agent"
         return result
     if workflow == "general_agent_workflow":
         result["route"] = "open_task"
@@ -247,7 +361,7 @@ def _normalize_route_result(result: dict[str, Any]) -> dict[str, Any]:
 
 
 def _derived_legacy_fields(query: str, result: dict[str, Any]) -> dict[str, Any]:
-    workflow = result.get("workflow", "chat_workflow")
+    workflow = result.get("workflow", "general_agent_workflow")
     fields: dict[str, Any] = {
         "search_query": _extract_english_keywords(query) if workflow == "paper_search_workflow" else "",
         "title_search": _looks_like_specific_title(query),
@@ -264,9 +378,12 @@ def _derived_legacy_fields(query: str, result: dict[str, Any]) -> dict[str, Any]
     }
     if workflow == "paper_search_workflow":
         fields["download_target"] = "specific" if fields["target_indices"] else ""
-    if workflow in {"academic_writing_workflow", "kb_writing_workflow", "uploaded_file_writing_workflow"}:
-        fields["need_retrieval"] = workflow == "kb_writing_workflow"
-        fields["use_retrieval"] = workflow == "kb_writing_workflow"
+    if workflow == "academic_writing_workflow":
+        # The writing workflow auto-detects retrieval need from source markers.
+        # Default to False here; build_academic_writing_graph flips it on when
+        # the source mode resolves to library / both.
+        fields["need_retrieval"] = False
+        fields["use_retrieval"] = False
     return fields
 
 
@@ -406,14 +523,53 @@ def _extract_indices(query: str) -> list[int]:
     q = query.lower().strip()
     values: list[int] = []
     patterns = (
+        r"(?:前|top)\s*(\d+)\s*(?:\u7bc7|\u4e2a|\u6761|paper|papers)?",
         r"\u7b2c\s*(\d+)\s*(?:\u7bc7|\u4e2a|\u6761|paper|papers)?",
         r"(?:\u4e0b\u8f7d|\u9009\u62e9|\u9009|download|select|choose|paper)\s*(\d+)\s*(?:\u7bc7|\u4e2a|\u6761|papers?)?",
     )
     for pattern in patterns:
         values.extend(int(x) for x in re.findall(pattern, q))
+    values.extend(_extract_chinese_ordinal_indices(q))
     if not values and re.fullmatch(r"\s*\d+(?:\s*(?:[,，、\s]|\band\b)\s*\d+)*\s*", q):
         values.extend(int(x) for x in re.findall(r"\d+", q))
     return [v for v in dict.fromkeys(values) if v > 0][:10]
+
+
+def _extract_chinese_ordinal_indices(query: str) -> list[int]:
+    values: list[int] = []
+    for match in re.finditer(r"(?:前|top)?\s*第\s*([一二三四五六七八九十百两零〇〇]+|\d+)\s*(?:篇|个|条|项|本|篇论文|篇文献)?", query):
+        token = match.group(1).strip()
+        index = _parse_ordinal_token(token)
+        if index > 0:
+            values.append(index)
+    return values
+
+
+def _parse_ordinal_token(token: str) -> int:
+    token = token.strip().lower()
+    if not token:
+        return 0
+    if token.isdigit():
+        return int(token)
+    cn_digits = {
+        "零": 0, "〇": 0,
+        "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
+        "六": 6, "七": 7, "八": 8, "九": 9,
+    }
+    if token == "十":
+        return 10
+    if len(token) == 2 and token[0] == "十" and token[1] in cn_digits:
+        return 10 + cn_digits[token[1]]
+    if len(token) == 2 and token[1] == "十" and token[0] in cn_digits:
+        return cn_digits[token[0]] * 10
+    if "十" in token:
+        parts = token.split("十", 1)
+        tens = cn_digits.get(parts[0], 0) if parts[0] else 1
+        ones = cn_digits.get(parts[1], 0) if len(parts) > 1 and parts[1] else 0
+        return tens * 10 + ones
+    if len(token) == 1 and token in cn_digits:
+        return cn_digits[token]
+    return 0
 
 
 def _infer_sort_by(query: str) -> str:

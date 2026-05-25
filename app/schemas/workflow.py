@@ -8,19 +8,40 @@ WORKFLOW_NAMES = {
     "conversation_summary_workflow",
     "question_answer_workflow",
     "image_understanding_workflow",
-    "library_ingest_workflow",
     "academic_writing_workflow",
-    "kb_writing_workflow",
-    "uploaded_file_writing_workflow",
-    "note_workflow",
     "general_agent_workflow",
-    "chat_workflow",
+    "research_agent_workflow",
+    "web_search_workflow",
+}
+
+# Deterministic "actions" — plain verbs with no branching reasoning, dispatched
+# directly by the orchestrator (app/orchestrator/actions.py) rather than compiled
+# into a LangGraph. They share the intent layer's `workflow` routing field but
+# are a distinct category: anything ending in `_action` is NOT a graph.
+ACTION_NAMES = {
+    "library_ingest_action",
+    "note_action",
+}
+
+# Valid route targets the intent layer may emit: a graph workflow or an action.
+ROUTE_TARGET_NAMES = WORKFLOW_NAMES | ACTION_NAMES
+
+# Routes that used to exist under a different name but were renamed/merged. Any
+# legacy session JSON or older LLM output that still names them gets normalised
+# to the live replacement at load time. The `*_workflow → *_action` entries are
+# from demoting those two graphs to direct action handlers.
+_LEGACY_WORKFLOW_ALIASES = {
+    "kb_writing_workflow": "academic_writing_workflow",
+    "uploaded_file_writing_workflow": "academic_writing_workflow",
+    "chat_workflow": "general_agent_workflow",
+    "library_ingest_workflow": "library_ingest_action",
+    "note_workflow": "note_action",
 }
 
 
 class WorkflowIntent(BaseModel):
     intent: str = "chat"
-    workflow: str = "chat_workflow"
+    workflow: str = "general_agent_workflow"
     confidence: float = Field(default=0.5, ge=0.0, le=1.0)
     need_clarification: bool = False
     clarification_question: Optional[str] = None
@@ -30,9 +51,11 @@ class WorkflowIntent(BaseModel):
 def normalize_workflow_intent(raw: dict) -> dict:
     """Normalize new workflow intent JSON while tolerating legacy intent payloads."""
     intent = str(raw.get("intent") or raw.get("user_intent") or "chat").strip() or "chat"
-    workflow = str(raw.get("workflow") or _legacy_workflow(intent) or "chat_workflow").strip()
-    if workflow not in WORKFLOW_NAMES:
-        workflow = "chat_workflow"
+    workflow = str(raw.get("workflow") or _legacy_workflow(intent) or "general_agent_workflow").strip()
+    # Redirect any legacy/merged-away workflow names to their live replacements.
+    workflow = _LEGACY_WORKFLOW_ALIASES.get(workflow, workflow)
+    if workflow not in ROUTE_TARGET_NAMES:
+        workflow = "general_agent_workflow"
     confidence = raw.get("confidence", 0.5)
     try:
         confidence = max(0.0, min(1.0, float(confidence)))
@@ -69,19 +92,21 @@ def _legacy_workflow(intent: str) -> str:
         "paper_qa": "question_answer_workflow",
         "library_qa": "question_answer_workflow",
         "image_understanding": "image_understanding_workflow",
-        "add_to_library": "library_ingest_workflow",
+        "add_to_library": "library_ingest_action",
         "paper_writing": "academic_writing_workflow",
-        "create_note": "note_workflow",
-        "create_note_from_chat": "note_workflow",
-        "create_note_from_summary": "note_workflow",
-        "create_note_from_reading": "note_workflow",
-        "update_note": "note_workflow",
-        "delete_note": "note_workflow",
-        "search_note": "note_workflow",
-        "embed_note": "note_workflow",
-        "reembed_note": "note_workflow",
-        "list_notes": "note_workflow",
-        "general_chat": "chat_workflow",
+        "create_note": "note_action",
+        "create_note_from_chat": "note_action",
+        "create_note_from_summary": "note_action",
+        "create_note_from_reading": "note_action",
+        "update_note": "note_action",
+        "delete_note": "note_action",
+        "search_note": "note_action",
+        "embed_note": "note_action",
+        "reembed_note": "note_action",
+        "list_notes": "note_action",
+        # chat is no longer a separate workflow — General Agent handles it.
+        "general_chat": "general_agent_workflow",
+        "chat": "general_agent_workflow",
     }
     return mapping.get(intent, "")
 
@@ -92,12 +117,11 @@ def _workflow_legacy_intent(workflow: str, fallback_intent: str) -> str:
         "conversation_summary_workflow": "summarize_session",
         "question_answer_workflow": "library_qa",
         "image_understanding_workflow": "image_understanding",
-        "library_ingest_workflow": "add_to_library",
+        "library_ingest_action": "add_to_library",
         "academic_writing_workflow": "paper_writing",
-        "kb_writing_workflow": "paper_writing",
-        "uploaded_file_writing_workflow": "paper_writing",
-        "note_workflow": fallback_intent if fallback_intent.endswith("note") or "note" in fallback_intent else "create_note",
+        "note_action": fallback_intent if fallback_intent.endswith("note") or "note" in fallback_intent else "create_note",
         "general_agent_workflow": "general_open_task",
-        "chat_workflow": "general_chat",
+        "research_agent_workflow": "research_task",
+        "web_search_workflow": "web_search",
     }
-    return mapping.get(workflow, fallback_intent or "general_chat")
+    return mapping.get(workflow, fallback_intent or "general_open_task")

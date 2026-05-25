@@ -17,110 +17,12 @@ from app.workflows.base import (
 logger = logging.getLogger(__name__)
 
 
-def build_kb_writing_graph(
-    *,
-    workflow_name: str,
-    agents: dict[str, BaseAgent],
-    build_agent_input: BuildAgentInput,
-    progress: ProgressCallback,
-):
-    builder = StateGraph(AgentWorkflowState)
-    builder.add_node("prepare_kb_writing", _prepare_kb_writing_node)
-    builder.add_node(
-        "retrieval_agent",
-        make_agent_node(
-            workflow_name=workflow_name,
-            agent_name="retrieval_agent",
-            agents=agents,
-            build_agent_input=build_agent_input,
-            progress=progress,
-        ),
-    )
-    builder.add_node(
-        "reading_agent",
-        make_agent_node(
-            workflow_name=workflow_name,
-            agent_name="reading_agent",
-            agents=agents,
-            build_agent_input=build_agent_input,
-            progress=progress,
-        ),
-    )
-    builder.add_node("reading_material", _reading_kb_material_node(progress))
-    builder.add_node(
-        "writing_agent",
-        make_agent_node(
-            workflow_name=workflow_name,
-            agent_name="writing_agent",
-            agents=agents,
-            build_agent_input=build_agent_input,
-            progress=progress,
-        ),
-    )
-    builder.set_entry_point("prepare_kb_writing")
-    builder.add_edge("prepare_kb_writing", "retrieval_agent")
-    builder.add_conditional_edges(
-        "retrieval_agent",
-        continue_or_end,
-        {
-            "continue": "reading_agent",
-            "end": END,
-        },
-    )
-    builder.add_conditional_edges(
-        "reading_agent",
-        continue_or_end,
-        {
-            "continue": "reading_material",
-            "end": END,
-        },
-    )
-    builder.add_edge("reading_material", "writing_agent")
-    builder.add_edge("writing_agent", END)
-    return builder.compile()
-
-
-def build_uploaded_file_writing_graph(
-    *,
-    workflow_name: str,
-    agents: dict[str, BaseAgent],
-    build_agent_input: BuildAgentInput,
-    progress: ProgressCallback,
-):
-    builder = StateGraph(AgentWorkflowState)
-    builder.add_node("validate_uploaded_file", _validate_uploaded_file_node)
-    builder.add_node("parse_uploaded_file", _parse_uploaded_file_node(progress))
-    builder.add_node("reading_file", _reading_uploaded_file_node)
-    builder.add_node(
-        "writing_agent",
-        make_agent_node(
-            workflow_name=workflow_name,
-            agent_name="writing_agent",
-            agents=agents,
-            build_agent_input=build_agent_input,
-            progress=progress,
-        ),
-    )
-    builder.set_entry_point("validate_uploaded_file")
-    builder.add_conditional_edges(
-        "validate_uploaded_file",
-        continue_or_end,
-        {
-            "continue": "parse_uploaded_file",
-            "end": END,
-        },
-    )
-    builder.add_conditional_edges(
-        "parse_uploaded_file",
-        continue_or_end,
-        {
-            "continue": "reading_file",
-            "end": END,
-        },
-    )
-    builder.add_edge("reading_file", "writing_agent")
-    builder.add_edge("writing_agent", END)
-    return builder.compile()
+# NOTE: build_kb_writing_graph and build_uploaded_file_writing_graph used to
+# live here. They were dead-code paths — build_academic_writing_graph below
+# already handles all four source modes (user_input_only / library / upload /
+# upload_plus_library) via _prepare_academic_writing_node's source detection.
+# All routing for "kb_writing_workflow" and "uploaded_file_writing_workflow"
+# is now aliased to "academic_writing_workflow" at the schema layer.
 
 
 def build_academic_writing_graph(
@@ -130,25 +32,24 @@ def build_academic_writing_graph(
     build_agent_input: BuildAgentInput,
     progress: ProgressCallback,
 ):
+    """Unified academic-writing graph.
+
+    Source-mode dispatch happens in `_prepare_academic_writing_node`:
+      - user_input_only  → writing_agent
+      - upload(+library) → parse uploaded file → (rag_agent if library) → writing_agent
+      - library          → rag_agent → collect_library_material → writing_agent
+
+    The previous retrieval_agent + reading_agent pair is now a single
+    rag_agent node — same downstream consumers, fewer hops."""
     builder = StateGraph(AgentWorkflowState)
     builder.add_node("prepare_academic_writing", _prepare_academic_writing_node)
     builder.add_node("parse_uploaded_file", _parse_uploaded_file_node(progress))
     builder.add_node("reading_file", _reading_uploaded_file_node)
     builder.add_node(
-        "retrieval_agent",
+        "rag_agent",
         make_agent_node(
             workflow_name=workflow_name,
-            agent_name="retrieval_agent",
-            agents=agents,
-            build_agent_input=build_agent_input,
-            progress=progress,
-        ),
-    )
-    builder.add_node(
-        "reading_agent",
-        make_agent_node(
-            workflow_name=workflow_name,
-            agent_name="reading_agent",
+            agent_name="rag_agent",
             agents=agents,
             build_agent_input=build_agent_input,
             progress=progress,
@@ -172,7 +73,7 @@ def build_academic_writing_graph(
         _route_after_academic_prepare,
         {
             "parse_upload": "parse_uploaded_file",
-            "retrieve_library": "retrieval_agent",
+            "retrieve_library": "rag_agent",
             "write": "writing_agent",
             "end": END,
         },
@@ -189,21 +90,13 @@ def build_academic_writing_graph(
         "reading_file",
         _route_after_uploaded_material,
         {
-            "retrieve_library": "retrieval_agent",
+            "retrieve_library": "rag_agent",
             "write": "writing_agent",
             "end": END,
         },
     )
     builder.add_conditional_edges(
-        "retrieval_agent",
-        continue_or_end,
-        {
-            "continue": "reading_agent",
-            "end": END,
-        },
-    )
-    builder.add_conditional_edges(
-        "reading_agent",
+        "rag_agent",
         continue_or_end,
         {
             "continue": "collect_library_material",
@@ -213,16 +106,6 @@ def build_academic_writing_graph(
     builder.add_edge("collect_library_material", "writing_agent")
     builder.add_edge("writing_agent", END)
     return builder.compile()
-
-
-async def _prepare_kb_writing_node(state: AgentWorkflowState) -> AgentWorkflowState:
-    task_state = state["task_state"]
-    task_state.working_memory["library_qa_mode"] = True
-    task_state.working_memory["writing_source"] = "library"
-    state["agent_names"] = ["retrieval_agent", "reading_agent", "writing_agent"]
-    state["total_agents"] = 3
-    state["done_agents"] = 0
-    return state
 
 
 async def _prepare_academic_writing_node(state: AgentWorkflowState) -> AgentWorkflowState:
@@ -256,13 +139,13 @@ async def _prepare_academic_writing_node(state: AgentWorkflowState) -> AgentWork
         agent_names = ["writing_agent"]
     elif has_uploads and wants_library:
         source_mode = "upload_plus_library"
-        agent_names = ["retrieval_agent", "reading_agent", "writing_agent"]
+        agent_names = ["rag_agent", "writing_agent"]
     elif has_uploads:
         source_mode = "upload"
         agent_names = ["writing_agent"]
     elif wants_library:
         source_mode = "library"
-        agent_names = ["retrieval_agent", "reading_agent", "writing_agent"]
+        agent_names = ["rag_agent", "writing_agent"]
     elif user_material:
         source_mode = "user_input_only"
         agent_names = ["writing_agent"]
@@ -297,24 +180,6 @@ def _route_after_uploaded_material(state: AgentWorkflowState) -> str:
     if source_mode == "upload_plus_library":
         return "retrieve_library"
     return "write"
-
-
-def _reading_kb_material_node(progress: ProgressCallback):
-    async def node(state: AgentWorkflowState) -> AgentWorkflowState:
-        task_state = state["task_state"]
-        retrieval = task_state.agent_outputs.get("retrieval_agent", {}).get("result", {})
-        reading = task_state.agent_outputs.get("reading_agent", {}).get("result", {})
-        chunks = retrieval.get("retrieved_chunks", [])
-        task_state.working_memory["writing_material_chunks"] = chunks
-        summary = _build_retrieval_summary(retrieval)
-        if reading.get("answer"):
-            summary = (summary + "\n\nReading synthesis:\n" + str(reading.get("answer"))[:1200]).strip()
-        task_state.working_memory["writing_material_summary"] = summary
-        task_state.current_stage = "writing_material_ready"
-        await progress("reading_material", "Preparing retrieved materials for writing...", 68)
-        return state
-
-    return node
 
 
 def _collect_library_material_node(progress: ProgressCallback):

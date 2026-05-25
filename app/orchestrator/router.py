@@ -7,28 +7,36 @@ _URL_RE = re.compile(r"https?://[^\s<>'\"）)】\]]+")
 
 
 def resolve_workflow(intent_result: dict, user_query: str, state: TaskState) -> str:
-    explicit_source = extract_writing_source(user_query)
+    """Final workflow decision.
+
+    Authority hierarchy (highest first):
+      1. UI-injected markers from the frontend  — ACADEMIC_WRITING=1,
+         WRITING_SOURCE=... — these are explicit user intent, not natural
+         language guesses, so they always win.
+      2. The Intent Agent's pick (intent_result["workflow"]). The Intent
+         Agent has session_context, history, and current_focus baked into
+         its prompt, so it is the single source of truth for natural-language
+         routing.
+      3. Legacy intent → workflow mapping (only fires if intent_result is
+         malformed and has no workflow but has a user_intent string).
+      4. Fallback: general_agent_workflow.
+
+    NO natural-language keyword matchers run here any more. Previously
+    `looks_like_library_query`, `looks_like_web_read_query`,
+    `looks_like_writing_followup`, etc. were applied as post-overrides,
+    which is what caused mid-task misrouting in earlier versions.
+    """
     if "ACADEMIC_WRITING=1" in user_query:
         return "academic_writing_workflow"
-    if explicit_source:
-        return "academic_writing_workflow"
-    if looks_like_writing_followup(user_query, state):
+    if extract_writing_source(user_query):
         return "academic_writing_workflow"
 
-    workflow = intent_result.get("workflow") or _legacy_intent_to_workflow(intent_result.get("user_intent", ""))
-    if workflow == "image_understanding_workflow":
-        return workflow
-    if looks_like_web_read_query(user_query):
-        return "web_search_workflow"
-    if workflow == "question_answer_workflow":
-        return workflow
-    if workflow:
-        return workflow
-    if looks_like_library_query(user_query):
-        return "question_answer_workflow"
-    if should_use_cached_library_context(user_query, state):
-        return "question_answer_workflow"
-    return "chat_workflow"
+    workflow = (
+        intent_result.get("workflow")
+        or _legacy_intent_to_workflow(intent_result.get("user_intent", ""))
+        or "general_agent_workflow"
+    )
+    return workflow
 
 
 def workflow_agent_plan(workflow: str, user_query: str, state: TaskState) -> list[str]:
@@ -37,48 +45,46 @@ def workflow_agent_plan(workflow: str, user_query: str, state: TaskState) -> lis
     if workflow == "conversation_summary_workflow":
         return ["summary_agent"]
     if workflow == "image_understanding_workflow":
-        return ["analyze_image", "chat_agent"]
-    if workflow == "library_ingest_workflow":
+        return ["analyze_image", "general_agent"]
+    if workflow == "library_ingest_action":
         return []
     if workflow == "academic_writing_workflow":
+        # Unified writing workflow: kb_writing / uploaded_file_writing were
+        # merged in. The graph's _prepare_academic_writing_node detects the
+        # real source mode from user_goal + state and picks the agents
+        # internally — this default_agents list is just a hint for the
+        # progress display when prepare hasn't run yet.
         source = extract_writing_source(user_query) or "auto"
         state.working_memory["writing_source"] = source
         if source in {"library", "both", "upload_plus_library"}:
             state.working_memory["library_qa_mode"] = True
-            return ["retrieval_agent", "reading_agent", "writing_agent"]
+            return ["rag_agent", "writing_agent"]
         return ["writing_agent"]
-    if workflow == "kb_writing_workflow":
-        state.working_memory["library_qa_mode"] = True
-        state.working_memory["writing_source"] = "library"
-        return ["retrieval_agent", "reading_agent", "writing_agent"]
-    if workflow == "uploaded_file_writing_workflow":
-        source = extract_writing_source(user_query) or "upload"
-        state.working_memory["writing_source"] = source
-        return ["writing_agent"]
-    if workflow == "note_workflow":
+    if workflow == "note_action":
         return ["note_agent"]
     if workflow == "general_agent_workflow":
         return ["general_agent"]
     if workflow == "question_answer_workflow":
+        # All three sources (web / uploaded_file / library) now go through
+        # rag_agent, which internally skips retrieval when it isn't needed.
         source = detect_qa_source(user_query, state)
         state.working_memory["qa_source"] = source
         if source == "web":
             state.working_memory["web_read_mode"] = True
             state.working_memory.pop("library_qa_mode", None)
-            return ["reading_agent"]
-        if source == "uploaded_file":
-            return ["reading_agent"]
-        state.working_memory["library_qa_mode"] = True
-        if should_use_cached_library_context(user_query, state):
-            state.working_memory["use_cached_library_context"] = True
-            return ["reading_agent"]
-        return ["retrieval_agent", "reading_agent"]
+        elif source == "uploaded_file":
+            state.working_memory.pop("library_qa_mode", None)
+        else:
+            state.working_memory["library_qa_mode"] = True
+            if should_use_cached_library_context(user_query, state):
+                state.working_memory["use_cached_library_context"] = True
+        return ["rag_agent"]
     if workflow == "web_search_workflow":
         state.working_memory["web_read_mode"] = True
         state.working_memory["qa_source"] = "web"
         state.working_memory.pop("library_qa_mode", None)
         return ["web_agent"]
-    return ["chat_agent"]
+    return ["general_agent"]
 
 
 def looks_like_writing_followup(query: str, state: TaskState) -> bool:
@@ -124,14 +130,11 @@ def workflow_intent_label_key(workflow: str, fallback: str) -> str:
         "question_answer_workflow": "library_qa",
         "web_search_workflow": "web_search",
         "image_understanding_workflow": "image_understanding",
-        "library_ingest_workflow": "add_to_library",
+        "library_ingest_action": "add_to_library",
         "academic_writing_workflow": "paper_writing",
-        "kb_writing_workflow": "paper_writing",
-        "uploaded_file_writing_workflow": "paper_writing",
-        "note_workflow": fallback if "note" in fallback else "create_note",
+        "note_action": fallback if "note" in fallback else "create_note",
         "general_agent_workflow": "general_open_task",
-        "chat_workflow": "general_chat",
-    }.get(workflow, fallback or "general_chat")
+    }.get(workflow, fallback or "general_open_task")
 
 
 def paper_search_intent_from_query(query: str) -> str:
@@ -348,17 +351,19 @@ def _legacy_intent_to_workflow(intent: str) -> str:
         "paper_qa": "question_answer_workflow",
         "library_qa": "question_answer_workflow",
         "image_understanding": "image_understanding_workflow",
-        "add_to_library": "library_ingest_workflow",
+        "add_to_library": "library_ingest_action",
         "paper_writing": "academic_writing_workflow",
-        "create_note": "note_workflow",
-        "create_note_from_chat": "note_workflow",
-        "create_note_from_summary": "note_workflow",
-        "create_note_from_reading": "note_workflow",
-        "update_note": "note_workflow",
-        "delete_note": "note_workflow",
-        "search_note": "note_workflow",
-        "embed_note": "note_workflow",
-        "reembed_note": "note_workflow",
-        "list_notes": "note_workflow",
-        "general_chat": "chat_workflow",
+        "create_note": "note_action",
+        "create_note_from_chat": "note_action",
+        "create_note_from_summary": "note_action",
+        "create_note_from_reading": "note_action",
+        "update_note": "note_action",
+        "delete_note": "note_action",
+        "search_note": "note_action",
+        "embed_note": "note_action",
+        "reembed_note": "note_action",
+        "list_notes": "note_action",
+        # chat_workflow was merged into general_agent_workflow.
+        "general_chat": "general_agent_workflow",
+        "chat": "general_agent_workflow",
     }.get(intent, "")

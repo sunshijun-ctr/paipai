@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, Optional
 
 import httpx
 
@@ -6,6 +6,24 @@ from app.config.settings import settings
 from app.schemas.tool import ToolResult
 from app.tools.base import BaseTool
 from app.tools.web.common import is_mostly_chinese
+
+
+def _fmt_exc(exc: BaseException) -> str:
+    """Some httpx exceptions (e.g. ConnectError(''), ReadTimeout()) stringify to
+    an empty string, which gives "serper: | tavily: " — useless. Always include
+    the exception class name so the cause is visible."""
+    msg = str(exc).strip()
+    return f"{type(exc).__name__}: {msg}" if msg else type(exc).__name__
+
+
+def _http_client(timeout: float = 20.0) -> httpx.AsyncClient:
+    """Build an httpx client that honours WEB_SEARCH_PROXY for these outbound
+    calls only (Tavily / Serper are both blocked / slow from mainland China —
+    users in CN typically need an HTTP/HTTPS proxy for these two endpoints)."""
+    proxy = (settings.web_search_proxy or "").strip() or None
+    if proxy:
+        return httpx.AsyncClient(timeout=timeout, proxy=proxy)
+    return httpx.AsyncClient(timeout=timeout)
 
 
 class WebSearchTool(BaseTool):
@@ -60,11 +78,17 @@ async def search_web_with_fallback(query: str, original: str, max_results: int) 
                 return results
             errors.append(f"{backend}: no results")
         except Exception as exc:
-            errors.append(f"{backend}: {exc}")
+            errors.append(f"{backend}: {_fmt_exc(exc)}")
 
     if not settings.tavily_api_key and not settings.serper_api_key:
         raise RuntimeError("Missing TAVILY_API_KEY or SERPER_API_KEY")
-    raise RuntimeError("Web search failed on all configured backends: " + " | ".join(errors))
+    # If we couldn't reach any backend AND there's no proxy configured, point
+    # the user at the most likely cause — mainland network can't reach
+    # api.tavily.com / google.serper.dev without one.
+    hint = ""
+    if not settings.web_search_proxy and any("ConnectError" in e or "Timeout" in e for e in errors):
+        hint = " (set WEB_SEARCH_PROXY in .env if you're behind a network that can't reach api.tavily.com / google.serper.dev directly)"
+    raise RuntimeError("Web search failed on all configured backends: " + " | ".join(errors) + hint)
 
 
 async def _search_tavily(query: str, max_results: int) -> list[dict[str, str]]:
@@ -76,7 +100,7 @@ async def _search_tavily(query: str, max_results: int) -> list[dict[str, str]]:
         "include_answer": False,
         "include_raw_content": False,
     }
-    async with httpx.AsyncClient(timeout=20) as client:
+    async with _http_client(timeout=20) as client:
         resp = await client.post("https://api.tavily.com/search", json=payload)
         resp.raise_for_status()
         data = resp.json()
@@ -95,7 +119,7 @@ async def _search_tavily(query: str, max_results: int) -> list[dict[str, str]]:
 async def _search_serper(query: str, max_results: int) -> list[dict[str, str]]:
     headers = {"X-API-KEY": settings.serper_api_key or "", "Content-Type": "application/json"}
     payload = {"q": query, "num": max_results}
-    async with httpx.AsyncClient(timeout=20) as client:
+    async with _http_client(timeout=20) as client:
         resp = await client.post("https://google.serper.dev/search", headers=headers, json=payload)
         resp.raise_for_status()
         data = resp.json()

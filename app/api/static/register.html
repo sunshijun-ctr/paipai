@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>注册 — Research Assistant</title>
+<link rel="stylesheet" href="/auth.css">
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <linearGradient id="grad-back" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#AFA9EC"/><stop offset="100%" stop-color="#9B6FD4"/>
+    </linearGradient>
+    <linearGradient id="grad-front" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#534AB7"/><stop offset="60%" stop-color="#7B5FC0"/><stop offset="100%" stop-color="#1D9E75"/>
+    </linearGradient>
+  </defs>
+</svg>
+<div class="auth-shell">
+  <div class="auth-card">
+    <a class="auth-brand" href="/" aria-label="paipai home">
+      <svg class="logo-svg" width="38" height="38" viewBox="0 0 68 68">
+        <text class="p-back"  x="4"  y="54">p</text>
+        <text class="p-front" x="22" y="46">p</text>
+      </svg>
+      <span class="auth-brand-name">paipai</span>
+    </a>
+    <h1 class="auth-title">创建账号</h1>
+    <p class="auth-subtitle">注册后我们会发激活邮件到你的邮箱</p>
+
+    <div id="alert" class="alert hidden" role="alert"></div>
+
+    <form id="register-form" class="auth-form">
+      <div class="field">
+        <label for="display_name">昵称</label>
+        <input id="display_name" type="text" minlength="1" maxlength="64" required>
+      </div>
+      <div class="field">
+        <label for="email">邮箱</label>
+        <input id="email" type="email" autocomplete="email" required>
+      </div>
+      <div class="field">
+        <label for="password">密码</label>
+        <input id="password" type="password" autocomplete="new-password" minlength="8" maxlength="128" required>
+        <small style="color:#6b7280;font-size:12px">至少 8 位</small>
+      </div>
+      <div class="field">
+        <label for="confirm">确认密码</label>
+        <input id="confirm" type="password" autocomplete="new-password" minlength="8" required>
+      </div>
+      <button type="submit" id="submit-btn" class="btn btn-primary btn-block">创建账号</button>
+    </form>
+
+    <div class="auth-foot">
+      已有账号？<a href="/login">直接登录</a>
+    </div>
+  </div>
+</div>
+
+<script src="/auth.js"></script>
+<script>
+const $alert = document.getElementById('alert');
+const $form = document.getElementById('register-form');
+const $btn = document.getElementById('submit-btn');
+
+function showAlert(msg, type='error') {
+  $alert.className = 'alert ' + type;
+  $alert.textContent = msg;
+}
+function hideAlert() { $alert.className = 'alert hidden'; }
+
+$form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  hideAlert();
+  const display_name = document.getElementById('display_name').value.trim();
+  const email = document.getElementById('email').value.trim();
+  const password = document.getElementById('password').value;
+  const confirm = document.getElementById('confirm').value;
+  if (password !== confirm) {
+    showAlert('两次输入的密码不一致', 'error');
+    return;
+  }
+  $btn.disabled = true; $btn.textContent = '提交中…';
+  try {
+    const res = await Auth.registerEmail({ email, password, display_name });
+    showAlert(res.message || '激活邮件已发送，请到邮箱查收', 'ok');
+    $form.querySelectorAll('input').forEach(i => i.disabled = true);
+  } catch (err) {
+    showAlert(err.message || '注册失败', 'error');
+  } finally {
+    $btn.disabled = false; $btn.textContent = '创建账号';
+  }
+});
+</script>
+</body>
+</html>

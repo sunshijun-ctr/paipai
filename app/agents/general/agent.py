@@ -30,6 +30,7 @@ Available context may include:
 - reading_agent results: answers from documents/library
 - summary_agent results: conversation summaries
 - note_agent results: note operations
+- image_analysis_tool results: extracted image context
 
 When using gathered context, synthesize it naturally. Do not mention implementation details unless helpful.
 When the user asks for design advice, give tradeoffs and a concrete recommendation.
@@ -50,7 +51,7 @@ class GeneralAgent(BaseAgent):
         history: list[dict] = agent_input.input_data.get("conversation_history", [])
         history_summary: str = agent_input.input_data.get("history_summary", "")
         current_task: str = agent_input.input_data.get("current_task", "")
-        gathered_context = _build_gathered_context(state.agent_outputs)
+        gathered_context = _build_gathered_context(state.agent_outputs, state.working_memory)
         intent_result = state.agent_outputs.get("intent_agent", {}).get("result", {})
         route_reason = intent_result.get("reason", "")
 
@@ -121,8 +122,15 @@ def _trim_history_by_token_estimate(
     return selected
 
 
-def _build_gathered_context(agent_outputs: dict[str, Any]) -> str:
+def _build_gathered_context(agent_outputs: dict[str, Any], working_memory: dict[str, Any]) -> str:
     parts: list[str] = []
+
+    image_analysis = agent_outputs.get("image_analysis_tool", {})
+    if image_analysis:
+        result = image_analysis.get("result", {})
+        image_context = result.get("context_for_agent") or working_memory.get("image_context") or ""
+        if image_context:
+            parts.append("Image analysis context:\n" + str(image_context)[:1600])
 
     literature = agent_outputs.get("literature_agent", {}).get("result", {})
     papers = literature.get("selected_papers") or []

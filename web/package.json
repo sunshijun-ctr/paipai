@@ -1,0 +1,15 @@
+{
+  "name": "paipai-web",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Frontend bundle for Research Assistant. Vanilla ESM today; React-ready when needed (frontend-migration.md phase 3).",
+  "scripts": {
+    "dev": "vite build --watch --mode development",
+    "build": "vite build",
+    "preview": "vite build && cd .. && python web_server.py --no-browser"
+  },
+  "devDependencies": {
+    "vite": "^5.4.0"
+  }
+}

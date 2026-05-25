@@ -162,24 +162,22 @@ _AGENT_NAMES = [
     "intent_agent",
     "general_agent",
     "literature_agent",
-    "reading_agent",
+    "rag_agent",
     "web_agent",
     "writing_agent",
     "note_agent",
     "summary_agent",
-    "chat_agent",
     "evaluator_agent",
 ]
 _AGENT_ENV_PREFIXES = {
     "intent_agent": "INTENT_AGENT",
     "general_agent": "GENERAL_AGENT",
     "literature_agent": "LITERATURE_AGENT",
-    "reading_agent": "READING_AGENT",
+    "rag_agent": "RAG_AGENT",
     "web_agent": "WEB_AGENT",
     "writing_agent": "WRITING_AGENT",
     "note_agent": "NOTE_AGENT",
     "summary_agent": "SUMMARY_AGENT",
-    "chat_agent": "CHAT_AGENT",
     "evaluator_agent": "EVALUATOR_AGENT",
 }
 
@@ -191,6 +189,23 @@ class LLMMessage(BaseModel):
 
 class LLMResponse(BaseModel):
     content: str
+    model: str
+    usage: Optional[dict[str, Any]] = None
+
+
+class ToolCall(BaseModel):
+    """One function-call request the LLM emitted in a tool-using turn."""
+    id: str
+    name: str
+    arguments: dict[str, Any]
+
+
+class ToolCallResponse(BaseModel):
+    """LLM response in a tool-calling loop. Either contains a final text answer
+    (tool_calls=[]) or a list of tool invocations to execute and feed back."""
+    content: str
+    tool_calls: list[ToolCall] = []
+    finish_reason: str = "stop"
     model: str
     usage: Optional[dict[str, Any]] = None
 
@@ -219,6 +234,27 @@ class BaseLLMProvider(ABC):
         elif "```" in content:
             content = content.split("```", 1)[1].split("```", 1)[0]
         return json.loads(content.strip())
+
+    async def complete_with_tools(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        system: Optional[str] = None,
+        **kwargs: Any,
+    ) -> ToolCallResponse:
+        """One LLM turn with function-calling. *messages* is the full multi-turn
+        history in OpenAI chat-completions format (so it can carry prior
+        `tool_calls` / `tool` role messages). *tools* is the OpenAI tools schema.
+
+        Returns either a final-answer (tool_calls=[]) or a tool-call request.
+        Subclasses that don't support function-calling should leave this raising
+        NotImplementedError — the calling agent should detect and fail clearly."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support function-calling. "
+            "Use an OpenAI-compatible provider (Qwen / Doubao / OpenAI / Gemini) "
+            "for ResearchAgent."
+        )
 
 
 class OllamaProvider(BaseLLMProvider):
@@ -356,6 +392,71 @@ class OpenAIProvider(BaseLLMProvider):
         )
         return LLMResponse(
             content=resp.choices[0].message.content or "",
+            model=resp.model,
+            usage=usage,
+        )
+
+    async def complete_with_tools(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        system: Optional[str] = None,
+        **kwargs: Any,
+    ) -> ToolCallResponse:
+        all_messages: list[dict[str, Any]] = []
+        if system:
+            all_messages.append({"role": "system", "content": system})
+        all_messages.extend(messages)
+
+        t0 = time.time()
+        task_name = kwargs.pop("task_name", None)
+        session_id = kwargs.pop("session_id", None)
+        try:
+            resp = await self.client.chat.completions.create(
+                model=self.model,
+                messages=all_messages,  # type: ignore[arg-type]
+                tools=tools,  # type: ignore[arg-type]
+                **kwargs,
+            )
+        except Exception as exc:
+            _fire_usage(
+                provider=self.provider_name,
+                model=self.model,
+                agent_name=self.agent_name,
+                usage=None,
+                latency_ms=int((time.time() - t0) * 1000),
+                status="error",
+                error_msg=str(exc),
+                task_name=task_name,
+                session_id=session_id,
+            )
+            raise
+
+        choice = resp.choices[0]
+        msg = choice.message
+        tool_calls: list[ToolCall] = []
+        for raw in (msg.tool_calls or []):
+            try:
+                args = json.loads(raw.function.arguments or "{}")
+            except json.JSONDecodeError:
+                args = {"_raw_arguments": raw.function.arguments}
+            tool_calls.append(ToolCall(id=raw.id, name=raw.function.name, arguments=args))
+
+        usage = resp.usage.model_dump() if resp.usage else None
+        _fire_usage(
+            provider=self.provider_name,
+            model=resp.model,
+            agent_name=self.agent_name,
+            usage=usage,
+            latency_ms=int((time.time() - t0) * 1000),
+            task_name=task_name,
+            session_id=session_id,
+        )
+        return ToolCallResponse(
+            content=msg.content or "",
+            tool_calls=tool_calls,
+            finish_reason=choice.finish_reason or "stop",
             model=resp.model,
             usage=usage,
         )

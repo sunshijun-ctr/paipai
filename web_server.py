@@ -5,6 +5,7 @@ Usage:
     python web_server.py --port 9000
 """
 import argparse
+import asyncio
 import logging
 import os
 import sys
@@ -14,6 +15,25 @@ import webbrowser
 
 # Always run from the project root so relative paths (data/, .env) resolve correctly
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
+
+# Windows + psycopg compat. There are TWO things to do:
+#
+#   1. Set the policy so anything that respects it gets the right loop.
+#   2. Override uvicorn 0.46's hardcoded ProactorEventLoop pick on Windows.
+#      uvicorn/loops/asyncio.py:asyncio_loop_factory unconditionally
+#      returns ProactorEventLoop on win32, which IGNORES our policy and
+#      causes psycopg.pool to log:
+#        "Psycopg cannot use the 'ProactorEventLoop' to run in async mode."
+#      Monkey-patching the factory is the minimal-blast-radius fix.
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    try:
+        import uvicorn.loops.asyncio as _ul
+        def _selector_loop_factory(*_args, **_kwargs):
+            return asyncio.SelectorEventLoop
+        _ul.asyncio_loop_factory = _selector_loop_factory
+    except ImportError:
+        pass  # uvicorn not yet installed when this file is being lint-checked
 
 # Load .env before any app module is imported (mirrors main.py behaviour)
 try:

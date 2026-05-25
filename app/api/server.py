@@ -20,12 +20,16 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi import Depends, FastAPI, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 
+from app.api.auth_router import router as auth_router
 from app.api.citation_router import router as citation_router
+from app.api.deps import optional_user, require_admin, require_user, require_user_ws
 from app.api.qq_webhook_api import router as qq_webhook_router
 from app.api.qq_webhook_api import set_qq_event_receiver
+from app.storage.postgres.users_repo import User
 from app.channels.qq.qq_client import QQClient
 from app.channels.qq.qq_config import QQConfig
 from app.channels.qq.qq_event_receiver import QQEventReceiver
@@ -130,6 +134,56 @@ def _get_mem(sid: str) -> MemoryManager:
     return mem
 
 
+def _session_owner_id(sid: str) -> str:
+    """Return the owner_user_id stored in the session's JSON, or '' if missing/malformed."""
+    cached = _sessions.get(sid)
+    if cached is not None:
+        return cached.short_term.owner_user_id or ""
+    path = os.path.join(_SESSIONS_DIR, f"{sid}.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return str(data.get("owner_user_id") or "")
+    except Exception:
+        return ""
+
+
+def _user_owns_session(user: "User", sid: str) -> bool:
+    """Admin sees everything; others must own the session."""
+    if user.is_admin:
+        return True
+    owner = _session_owner_id(sid)
+    return bool(owner) and owner == user.id
+
+
+def _ensure_session_owner(user: "User", sid: str) -> None:
+    """Raise 404 if the current user is not allowed to touch this session.
+
+    We deliberately return 404 (not 403) so we don't leak which session IDs exist."""
+    if not _user_owns_session(user, sid):
+        raise HTTPException(404, "session not found")
+
+
+def _stamp_session_owner(mem: MemoryManager, user: "User") -> None:
+    """If a session has no owner yet, claim it for *user* and persist."""
+    if not mem.short_term.owner_user_id:
+        mem.short_term.owner_user_id = user.id
+        mem.save()
+
+
+def _ensure_library_owner(user: "User", lib_id: str) -> None:
+    """Raise 404 if *user* may not access this library.
+
+    Admins bypass; owners of the library pass; everyone else gets 404 so we
+    don't leak which lib_ids exist."""
+    if user.is_admin:
+        return
+    from app.rag.long_term.store import get_lt_rag_store
+    owner = get_lt_rag_store().get_library_owner(lib_id)
+    if not owner or owner != user.id:
+        raise HTTPException(404, "library not found")
+
+
 def _paper_extra_meta(paper: dict) -> dict:
     keys = ("venue", "journal", "doi", "paper_id", "published_date", "authors", "citations", "source")
     meta = {key: paper.get(key) for key in keys if paper.get(key) not in (None, "")}
@@ -178,6 +232,19 @@ def _paper_identity(paper: dict) -> str:
 async def lifespan(app: FastAPI):
     global _orch
     _orch = Orchestrator()
+    # Admin bootstrap + legacy session ownership migration. Idempotent.
+    try:
+        from app.services.admin_bootstrap import run_startup_bootstrap
+        run_startup_bootstrap()
+    except Exception as exc:
+        logger.warning("Admin bootstrap pipeline failed: %s", exc)
+    # ResearchAgent's Postgres checkpointer (Phase C). Idempotent setup;
+    # graph still runs without it if DB is missing.
+    try:
+        from app.orchestrator.research_checkpointer import init_research_checkpointer
+        await init_research_checkpointer()
+    except Exception as exc:
+        logger.warning("Research checkpointer init failed: %s", exc)
     qq_config = QQConfig()
     qq_sender = None
     if qq_config.bot_app_id and qq_config.bot_secret:
@@ -192,21 +259,170 @@ async def lifespan(app: FastAPI):
     logger.info("Research Assistant web server ready")
     yield
     set_qq_event_receiver(None)
+    try:
+        from app.orchestrator.research_checkpointer import close_research_checkpointer
+        await close_research_checkpointer()
+    except Exception as exc:
+        logger.warning("Research checkpointer close failed: %s", exc)
     logger.info("Server shutdown")
 
 
 app = FastAPI(title="Research Assistant", lifespan=lifespan)
 app.include_router(citation_router)
 app.include_router(qq_webhook_router)
+app.include_router(auth_router)
 _static_dir = os.path.join(os.path.dirname(__file__), "static")
+
+
+def _build_version() -> str:
+    """Short identifier the frontend appends as `?v=<version>` to every
+    static asset URL. Refreshes when any file under static/ changes (or
+    on git HEAD movement) so users never serve a stale JS/CSS while
+    holding a new HTML.
+
+    Two strategies, in order of preference:
+      1. git HEAD SHA — stable across restarts, perfect for production deploys
+      2. md5 of all static file mtimes — works for dev where there's no git
+    """
+    import hashlib
+    import pathlib
+    try:
+        head = pathlib.Path(".git/HEAD").read_text(encoding="utf-8").strip()
+        if head.startswith("ref:"):
+            ref = pathlib.Path(".git") / head.split(" ", 1)[1].strip()
+            return ref.read_text(encoding="utf-8").strip()[:8]
+        return head[:8]
+    except Exception:
+        h = hashlib.md5()
+        try:
+            for p in sorted(pathlib.Path(_static_dir).rglob("*")):
+                if p.is_file():
+                    h.update(f"{p.name}:{p.stat().st_mtime_ns}".encode())
+        except Exception:
+            pass
+        return h.hexdigest()[:8] or "dev"
+
+
+_STATIC_VERSION = _build_version()
+logger.info("Static asset version: %s", _STATIC_VERSION)
+
+
+def _vite_entry(entry: str = "src/main.js") -> str:
+    """Resolve a Vite manifest entry to its hashed output path.
+
+    Reads ``app/api/static/dist/.vite/manifest.json`` (produced by
+    ``cd web && npm run build``). When the file is missing — e.g. the
+    bundle hasn't been built yet — we fall back to ``""`` and the
+    index.html template loads no bundle. The legacy inline scripts keep
+    working in the meantime.
+    """
+    import json
+    import pathlib
+    manifest_path = pathlib.Path(_static_dir) / "dist" / ".vite" / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        return "/static/dist/" + manifest[entry]["file"]
+    except FileNotFoundError:
+        logger.warning("Vite manifest not found at %s — run `cd web && npm run build`", manifest_path)
+        return ""
+    except (KeyError, json.JSONDecodeError) as exc:
+        logger.warning("Vite manifest unreadable: %s", exc)
+        return ""
+
+
+logger.info("Frontend bundle entry (startup): %s", _vite_entry() or "(not built)")
+
+# Serve /static/* directly from app/api/static/. Used by Phase 2.2 CSS
+# extraction (and Phase 2.3 JS modules later). In production, Caddy
+# overrides Cache-Control on this prefix to long-cache; in dev the
+# default no-cache from FastAPI is fine.
+app.mount("/static", StaticFiles(directory=_static_dir), name="static")
+
+
+# ── Static auth pages ─────────────────────────────────────────────────────────
+
+def _serve_static(filename: str, media_type: Optional[str] = None) -> FileResponse:
+    path = os.path.join(_static_dir, filename)
+    if not os.path.exists(path):
+        raise HTTPException(404, f"{filename} not found")
+    return FileResponse(path, media_type=media_type)
+
+
+@app.get("/login", response_class=HTMLResponse)
+@app.get("/login.html", response_class=HTMLResponse)
+async def login_page():
+    return _serve_static("login.html", media_type="text/html")
+
+
+@app.get("/register", response_class=HTMLResponse)
+@app.get("/register.html", response_class=HTMLResponse)
+async def register_page():
+    return _serve_static("register.html", media_type="text/html")
+
+
+@app.get("/account", response_class=HTMLResponse)
+@app.get("/account.html", response_class=HTMLResponse)
+async def account_page():
+    return _serve_static("account.html", media_type="text/html")
+
+
+@app.get("/auth.js")
+async def auth_js():
+    return _serve_static("auth.js", media_type="application/javascript")
+
+
+@app.get("/auth.css")
+async def auth_css():
+    return _serve_static("auth.css", media_type="text/css")
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.get("/", response_class=HTMLResponse)
-async def index():
+async def landing():
+    """Public landing page — accessible without login."""
+    return _serve_static("landing.html", media_type="text/html")
+
+
+@app.get("/app", response_class=HTMLResponse)
+async def app_index(user: Optional[User] = Depends(optional_user)):
+    """Main application — requires authentication.
+
+    Substitutes ``{{V}}`` placeholders in index.html with the current
+    build version (see :func:`_build_version`) so any ``?v={{V}}``
+    appended to a static asset URL becomes a real cache-busting query
+    string. ``no-cache`` on this response forces the browser to revalidate
+    the HTML every load, while sub-resources stay long-cached behind
+    the version-stamped URL.
+    """
+    if user is None:
+        return RedirectResponse(url="/login?next=%2Fapp", status_code=302)
+    from app.config.settings import settings
     with open(os.path.join(_static_dir, "index.html"), encoding="utf-8") as f:
-        return f.read()
+        html = f.read()
+    # Read the Vite manifest per request so `npm run dev`'s rolling
+    # rebuilds get picked up without restarting uvicorn. Tiny file, OS
+    # caches the disk read — negligible overhead.
+    js_entry = _vite_entry()
+    js_entry_tag = (
+        f'<script type="module" src="{js_entry}" defer></script>'
+        if js_entry
+        else "<!-- frontend bundle not built — `cd web && npm run build` -->"
+    )
+    html = (
+        html
+        .replace("{{V}}", _STATIC_VERSION)
+        .replace("{{SENTRY_DSN}}", (settings.sentry_dsn or "").strip())
+        .replace("{{JS_ENTRY_TAG}}", js_entry_tag)
+    )
+    return HTMLResponse(content=html, headers={"Cache-Control": "no-cache"})
+
+
+@app.get("/api/app-version")
+async def app_version():
+    """Frontend reads this to decide whether to prompt a reload after a
+    server-side upgrade. Cheap, no-auth, just the version string."""
+    return {"version": _STATIC_VERSION}
 
 
 @app.get("/health")
@@ -263,7 +479,8 @@ def _monitor_fetch(sql: str, params: tuple = (), *, one: bool = False):
 
 
 @app.get("/monitor/summary")
-async def monitor_summary(days: int = Query(7, ge=1, le=90), agent_name: Optional[str] = None):
+async def monitor_summary(days: int = Query(7, ge=1, le=90), agent_name: Optional[str] = None,
+                          admin: User = Depends(require_admin)):
     where = "created_at >= NOW() - (%s * INTERVAL '1 day')"
     params: list = [days]
     if agent_name:
@@ -290,7 +507,8 @@ async def monitor_summary(days: int = Query(7, ge=1, le=90), agent_name: Optiona
 
 
 @app.get("/monitor/daily-trend")
-async def monitor_daily_trend(days: int = Query(7, ge=1, le=90), agent_name: Optional[str] = None):
+async def monitor_daily_trend(days: int = Query(7, ge=1, le=90), agent_name: Optional[str] = None,
+                              admin: User = Depends(require_admin)):
     where = "created_at >= NOW() - (%s * INTERVAL '1 day')"
     params: list = [days]
     if agent_name:
@@ -315,7 +533,8 @@ async def monitor_daily_trend(days: int = Query(7, ge=1, le=90), agent_name: Opt
 
 
 @app.get("/monitor/model-breakdown")
-async def monitor_model_breakdown(days: int = Query(7, ge=1, le=90), agent_name: Optional[str] = None):
+async def monitor_model_breakdown(days: int = Query(7, ge=1, le=90), agent_name: Optional[str] = None,
+                                  admin: User = Depends(require_admin)):
     where = "created_at >= NOW() - (%s * INTERVAL '1 day')"
     params: list = [days]
     if agent_name:
@@ -344,7 +563,8 @@ async def monitor_model_breakdown(days: int = Query(7, ge=1, le=90), agent_name:
 
 
 @app.get("/monitor/hourly")
-async def monitor_hourly(days: int = Query(7, ge=1, le=90), agent_name: Optional[str] = None):
+async def monitor_hourly(days: int = Query(7, ge=1, le=90), agent_name: Optional[str] = None,
+                         admin: User = Depends(require_admin)):
     where = "created_at >= NOW() - (%s * INTERVAL '1 day')"
     params: list = [days]
     if agent_name:
@@ -368,7 +588,8 @@ async def monitor_hourly(days: int = Query(7, ge=1, le=90), agent_name: Optional
 
 
 @app.get("/monitor/agents")
-async def monitor_agents(days: int = Query(7, ge=1, le=90)):
+async def monitor_agents(days: int = Query(7, ge=1, le=90),
+                         admin: User = Depends(require_admin)):
     return _monitor_fetch(
         """
         SELECT
@@ -387,7 +608,8 @@ async def monitor_agents(days: int = Query(7, ge=1, le=90)):
 
 
 @app.get("/monitor/errors")
-async def monitor_errors(days: int = Query(1, ge=1, le=30), limit: int = Query(50, ge=1, le=200)):
+async def monitor_errors(days: int = Query(1, ge=1, le=30), limit: int = Query(50, ge=1, le=200),
+                         admin: User = Depends(require_admin)):
     return _monitor_fetch(
         """
         SELECT
@@ -409,8 +631,11 @@ async def monitor_errors(days: int = Query(1, ge=1, le=30), limit: int = Query(5
 
 
 @app.get("/api/sessions")
-async def list_sessions():
-    """Return all sessions sorted by last-modified (newest first)."""
+async def list_sessions(user: User = Depends(require_user)):
+    """Return sessions visible to *user*.
+
+    Regular users see only sessions they own (`owner_user_id == user.id`).
+    Admins see every session — including legacy unowned ones."""
     result: list[dict] = []
     if not os.path.exists(_SESSIONS_DIR):
         return {"sessions": result}
@@ -427,6 +652,9 @@ async def list_sessions():
         try:
             with open(os.path.join(_SESSIONS_DIR, fname), encoding="utf-8") as f:
                 data = json.load(f)
+            owner = str(data.get("owner_user_id") or "")
+            if not user.is_admin and owner != user.id:
+                continue
             turns = data.get("recent_turns", [])
             first_user = next(
                 (m["content"] for m in turns if m.get("role") == "user"), ""
@@ -444,16 +672,18 @@ async def list_sessions():
 
 
 @app.post("/api/sessions", status_code=201)
-async def create_session():
-    """Create and return a new empty session."""
+async def create_session(user: User = Depends(require_user)):
+    """Create and return a new empty session owned by *user*."""
     sid = f"session_{uuid.uuid4().hex[:8]}"
-    _get_mem(sid)           # initialise + cache
+    mem = _get_mem(sid)           # initialise + cache
+    _stamp_session_owner(mem, user)
     return {"session_id": sid}
 
 
 @app.get("/api/sessions/{sid}")
-async def get_session_detail(sid: str):
+async def get_session_detail(sid: str, user: User = Depends(require_user)):
     """Return a session's conversation history and current paper state."""
+    _ensure_session_owner(user, sid)
     mem = _get_mem(sid)
     lib_titles: list[str] = []
     try:
@@ -472,8 +702,9 @@ async def get_session_detail(sid: str):
 
 
 @app.delete("/api/sessions/{sid}", status_code=204)
-async def delete_session(sid: str):
+async def delete_session(sid: str, user: User = Depends(require_user)):
     """Remove a session from memory cache and delete its persisted file."""
+    _ensure_session_owner(user, sid)
     _sessions.pop(sid, None)
     path = os.path.join(_SESSIONS_DIR, f"{sid}.json")
     try:
@@ -483,8 +714,9 @@ async def delete_session(sid: str):
 
 
 @app.post("/api/sessions/{sid}/compress")
-async def compress_session(sid: str):
+async def compress_session(sid: str, user: User = Depends(require_user)):
     """Manually compress older messages in one session."""
+    _ensure_session_owner(user, sid)
     mem = _get_mem(sid)
     await mem.compress_now()
     mem.save()
@@ -495,14 +727,61 @@ async def compress_session(sid: str):
     }
 
 
+@app.post("/api/research/{task_id}/resume")
+async def research_resume(task_id: str, body: dict, user: User = Depends(require_user)):
+    """Resume a paused ResearchAgent plan-approval checkpoint.
+
+    Body schema:
+        {"action": "approve" | "modify" | "cancel",
+         "modified_plan": {... full plan dict ...}}    # only when action="modify"
+
+    The actual graph resume happens in the executor's wait loop — this
+    endpoint just signals the asyncio.Event keyed by task_id.
+
+    Auth: caller must be the user who started the workflow. Without this
+    check any logged-in user could cancel / modify someone else's task
+    by guessing the task_id.
+    """
+    from app.orchestrator.research_hitl import get_owner, signal_resume
+
+    action = (body.get("action") or "").lower().strip()
+    if action not in {"approve", "modify", "cancel"}:
+        raise HTTPException(400, "action must be one of: approve, modify, cancel")
+
+    owner = get_owner(task_id)
+    if owner is None:
+        # No active checkpoint — most likely it already timed out and
+        # auto-approved, or the client is stale. Return 409 so the UI
+        # can clear its plan card.
+        raise HTTPException(409, "no pending checkpoint for this task")
+    if owner and owner != user.id and not user.is_admin:
+        # Don't leak whether the checkpoint exists for a different user —
+        # respond with the same 404 we'd give a never-existed task.
+        raise HTTPException(404, "task not found")
+
+    decision: dict = {"action": action}
+    if action == "modify":
+        modified = body.get("modified_plan")
+        if not isinstance(modified, dict) or not modified.get("steps"):
+            raise HTTPException(400, "modify action requires modified_plan with non-empty steps")
+        decision["modified_plan"] = modified
+
+    if not signal_resume(task_id, decision):
+        raise HTTPException(409, "no pending checkpoint for this task")
+
+    return {"task_id": task_id, "action": action, "status": "signalled"}
+
+
 @app.get("/api/libraries")
-async def list_libraries():
-    """Return all knowledge-base libraries with their document counts."""
+async def list_libraries(user: User = Depends(require_user)):
+    """Return libraries visible to *user*.
+
+    Regular users see only libraries they own; admins see every library."""
     from app.rag.long_term.store import get_lt_rag_store
     from app.services.note_service import get_note_service
     await get_note_service().sync_embedded_notes_to_library()
     lt  = get_lt_rag_store()
-    libs = lt.list_libraries()
+    libs = lt.list_libraries(owner_user_id=user.id, include_all=user.is_admin)
     result = []
     for lib in libs:
         titles = await lt.list_documents(lib["lib_id"])
@@ -511,15 +790,15 @@ async def list_libraries():
 
 
 @app.get("/api/profile")
-async def get_profile():
-    """Return user-facing profile settings stored in long-term memory."""
+async def get_profile(user: User = Depends(require_user)):
+    """Return the caller's profile settings."""
     from app.memory.manager import _get_long_term
-    return {"profile": _get_long_term().get_profile_settings()}
+    return {"profile": _get_long_term().get_profile_settings(user_id=user.id)}
 
 
 @app.put("/api/profile")
-async def update_profile(body: dict):
-    """Update user profile settings and index self-description as long-term memory."""
+async def update_profile(body: dict, user: User = Depends(require_user)):
+    """Update *user*'s profile and index their self-description as long-term memory."""
     from app.memory.manager import _get_long_term
 
     display_name = str(body.get("display_name") or "").strip()
@@ -534,7 +813,9 @@ async def update_profile(body: dict):
         raise HTTPException(400, "self_description is too long")
 
     lt_mem = _get_long_term()
-    profile = lt_mem.update_profile_settings(display_name, avatar, self_description)
+    profile = lt_mem.update_profile_settings(
+        display_name, avatar, self_description, user_id=user.id,
+    )
     lt_mem.save()
 
     if self_description:
@@ -556,18 +837,21 @@ async def update_profile(body: dict):
 
 
 @app.get("/api/llm-config")
-async def get_llm_config():
-    """Return per-agent LLM configuration for the settings UI."""
+async def get_llm_config(user: User = Depends(require_user)):
+    """Return per-agent LLM configuration. System-level — visible to any signed-in user."""
     from app.services.llm import get_available_llm_options, load_agent_llm_config
     return {
         "config": load_agent_llm_config(),
         "options": get_available_llm_options(),
+        "writable": user.is_admin,
     }
 
 
 @app.put("/api/llm-config")
-async def update_llm_config(body: dict):
-    """Persist per-agent LLM configuration and hot-reload agents."""
+async def update_llm_config(body: dict, user: User = Depends(require_user)):
+    """Persist per-agent LLM configuration. Admin-only — this changes system behaviour."""
+    if not user.is_admin:
+        raise HTTPException(403, "only the admin can change LLM configuration")
     from app.services.llm import save_agent_llm_config
 
     config = body.get("config") or {}
@@ -584,8 +868,10 @@ async def update_llm_config(body: dict):
 
 
 @app.post("/api/llm-config/test")
-async def test_llm_config(body: dict):
-    """Test one provider/model pair without saving it."""
+async def test_llm_config(body: dict, user: User = Depends(require_user)):
+    """Test one provider/model pair without saving it. Admin-only."""
+    if not user.is_admin:
+        raise HTTPException(403, "only the admin can test LLM configuration")
     import time
     from app.services.llm import LLMMessage, get_agent_llm_provider, get_llm_provider
 
@@ -629,8 +915,12 @@ async def test_llm_config(body: dict):
 
 
 @app.post("/api/academic-writing-chat")
-async def academic_writing_chat(body: dict):
-    """Small backend proxy for the academic writing chat page."""
+async def academic_writing_chat(body: dict, user: User = Depends(require_user)):
+    """Small backend proxy for the academic writing chat page.
+
+    Auth required — this endpoint invokes the configured text LLM and
+    would otherwise let anonymous callers burn the API budget.
+    """
     from app.services.llm import LLMMessage, get_agent_llm_provider, load_agent_llm_config
 
     labels = {
@@ -675,11 +965,17 @@ async def academic_writing_chat(body: dict):
 
 
 @app.post("/api/stop")
-async def stop_generation(body: dict):
-    """Cancel the currently running agent task for a session."""
+async def stop_generation(body: dict, user: User = Depends(require_user)):
+    """Cancel the currently running agent task for a session.
+
+    Auth + ownership check — otherwise anonymous callers could DoS by
+    cancelling arbitrary in-flight tasks once they know (or guess) the
+    session_id.
+    """
     sid = str(body.get("session_id") or "").strip()
     if not sid:
         raise HTTPException(400, "session_id is required")
+    _ensure_session_owner(user, sid)
     task = _running_tasks.get(sid)
     if not task or task.done():
         return {"stopped": False, "message": "no running task"}
@@ -688,8 +984,9 @@ async def stop_generation(body: dict):
 
 
 @app.post("/api/sessions/{sid}/papers/download")
-async def download_session_found_paper(sid: str, body: dict):
+async def download_session_found_paper(sid: str, body: dict, user: User = Depends(require_user)):
     """Download one paper from the current search results without starting a chat workflow."""
+    _ensure_session_owner(user, sid)
     mem = _get_mem(sid)
     paper = _resolve_found_paper(mem.short_term.found_papers or [], body)
     if not paper:
@@ -727,8 +1024,9 @@ async def download_session_found_paper(sid: str, body: dict):
 
 
 @app.get("/api/sessions/{sid}/papers/file")
-async def read_session_paper_file(sid: str, index: int | None = None, title: str = ""):
+async def read_session_paper_file(sid: str, index: int | None = None, title: str = "", user: User = Depends(require_user)):
     """Serve a downloaded session paper for inline reading."""
+    _ensure_session_owner(user, sid)
     mem = _get_mem(sid)
     papers = mem.short_term.stored_papers or []
     paper = None
@@ -758,18 +1056,20 @@ async def read_session_paper_file(sid: str, index: int | None = None, title: str
 
 
 @app.post("/api/sessions/{sid}/library/add")
-async def add_session_papers_to_library(sid: str, body: dict):
+async def add_session_papers_to_library(sid: str, body: dict, user: User = Depends(require_user)):
     """Index downloaded session papers into the long-term knowledge base.
 
     This endpoint intentionally bypasses the chat orchestrator so a user can
     store papers while a long-running reading task continues on the WebSocket.
     """
+    _ensure_session_owner(user, sid)
     mem = _get_mem(sid)
     papers = mem.short_term.stored_papers or []
     if not papers:
         raise HTTPException(400, "no downloaded papers in this session")
 
     lib_id = str(body.get("lib_id") or "lt_docs").strip() or "lt_docs"
+    _ensure_library_owner(user, lib_id)
     selected: list[dict] = []
 
     if body.get("index") is not None:
@@ -826,7 +1126,7 @@ async def add_session_papers_to_library(sid: str, body: dict):
 
 
 @app.post("/api/evaluation/rag")
-async def evaluate_rag_sample(body: dict):
+async def evaluate_rag_sample(body: dict, user: User = Depends(require_user)):
     """Evaluate one RAG answer sample without running the full agent pipeline."""
     from app.services.evaluation import EvaluationService, RAGEvaluationSample
 
@@ -845,22 +1145,47 @@ async def evaluate_rag_sample(body: dict):
     return {"evaluation": result}
 
 
-@app.get("/api/notes")
-async def list_notes(q: str = "", tag: str = "", source_type: str = ""):
+def _ensure_note_owner(user: User, note_id: str):
+    """Return the note if visible to *user*; raise 404 otherwise."""
     from app.services.note_service import get_note_service
-    notes = get_note_service().list_notes(
-        user_id="local",
-        filters={"query": q, "tag": tag, "source_type": source_type},
-    )
+    try:
+        note = get_note_service().get_note(note_id)
+    except KeyError:
+        raise HTTPException(404, "note not found")
+    if not user.is_admin and note.user_id != user.id:
+        raise HTTPException(404, "note not found")
+    return note
+
+
+@app.get("/api/notes")
+async def list_notes(q: str = "", tag: str = "", source_type: str = "",
+                     user: User = Depends(require_user)):
+    from app.services.note_service import get_note_service
+    if user.is_admin:
+        # Admins see everything; merge a couple of common owner buckets.
+        svc = get_note_service()
+        seen: dict[str, object] = {}
+        for owner in (user.id, "local"):
+            for n in svc.list_notes(
+                user_id=owner,
+                filters={"query": q, "tag": tag, "source_type": source_type},
+            ):
+                seen[n.id] = n
+        notes = sorted(seen.values(), key=lambda n: n.updated_at, reverse=True)
+    else:
+        notes = get_note_service().list_notes(
+            user_id=user.id,
+            filters={"query": q, "tag": tag, "source_type": source_type},
+        )
     return {"notes": [n.model_dump() for n in notes]}
 
 
 @app.post("/api/notes", status_code=201)
-async def create_note(body: dict):
+async def create_note(body: dict, user: User = Depends(require_user)):
     from app.schemas.note_schema import NoteCreate
     from app.services.note_service import get_note_service
     note = get_note_service().create_note(NoteCreate(
-        user_id="local",
+        user_id=user.id,
         title=(body.get("title") or "新笔记").strip(),
         content_markdown=body.get("content_markdown") or "",
         source_type=body.get("source_type") or "manual",
@@ -874,24 +1199,15 @@ async def create_note(body: dict):
 
 
 @app.get("/api/notes/{note_id}")
-async def get_note(note_id: str):
-    from app.services.note_service import get_note_service
-    try:
-        note = get_note_service().get_note(note_id)
-    except KeyError:
-        raise HTTPException(404, "note not found")
+async def get_note(note_id: str, user: User = Depends(require_user)):
+    note = _ensure_note_owner(user, note_id)
     return {"note": note.model_dump()}
 
 
 @app.get("/api/notes/{note_id}/export.pdf")
-async def export_note_pdf(note_id: str):
+async def export_note_pdf(note_id: str, user: User = Depends(require_user)):
     from app.services.note_export import export_note_to_pdf, safe_pdf_filename
-    from app.services.note_service import get_note_service
-
-    try:
-        note = get_note_service().get_note(note_id)
-    except KeyError:
-        raise HTTPException(404, "note not found")
+    note = _ensure_note_owner(user, note_id)
 
     export_dir = os.path.join(".", "data", "exports", "notes")
     output_path = os.path.join(export_dir, f"{note_id}.pdf")
@@ -908,7 +1224,8 @@ async def export_note_pdf(note_id: str):
 
 
 @app.put("/api/notes/{note_id}")
-async def update_note(note_id: str, body: dict):
+async def update_note(note_id: str, body: dict, user: User = Depends(require_user)):
+    _ensure_note_owner(user, note_id)
     from app.schemas.note_schema import NoteUpdate
     from app.services.note_service import get_note_service
     try:
@@ -919,14 +1236,22 @@ async def update_note(note_id: str, body: dict):
 
 
 @app.delete("/api/notes/{note_id}", status_code=204)
-async def delete_note(note_id: str):
+async def delete_note(note_id: str, user: User = Depends(require_user)):
+    note = _ensure_note_owner(user, note_id)
     from app.services.note_service import get_note_service
+    logger.warning(
+        "Delete note requested: note_id=%s note_user=%s request_user=%s is_admin=%s",
+        note_id, note.user_id, user.id, user.is_admin,
+    )
     if not get_note_service().delete_note(note_id):
+        logger.warning("Delete note failed/not found: note_id=%s", note_id)
         raise HTTPException(404, "note not found")
+    logger.warning("Delete note succeeded: note_id=%s", note_id)
 
 
 @app.post("/api/notes/{note_id}/embed")
-async def embed_note(note_id: str):
+async def embed_note(note_id: str, user: User = Depends(require_user)):
+    _ensure_note_owner(user, note_id)
     from app.services.note_service import get_note_service
     try:
         result = await get_note_service().embed_note(note_id)
@@ -936,18 +1261,36 @@ async def embed_note(note_id: str):
 
 
 @app.get("/api/day-tasks")
-async def list_day_tasks(date: str = "", month: str = "", user_id: str = "local"):
+async def list_day_tasks(date: str = "", month: str = "",
+                         user: User = Depends(require_user)):
     from app.services.calendar_service import get_daily_schedule_service
-    tasks = get_daily_schedule_service().list_tasks(
-        user_id=user_id or "local",
-        date=date,
-        month=month,
-    )
+    svc = get_daily_schedule_service()
+    if user.is_admin:
+        # Admins see their own tasks plus anything still tagged 'local'.
+        merged = {}
+        for owner in (user.id, "local"):
+            for t in svc.list_tasks(user_id=owner, date=date, month=month):
+                merged[t.id] = t
+        tasks = sorted(merged.values(), key=lambda t: (t.task_date, t.start_time, t.created_at))
+    else:
+        tasks = svc.list_tasks(user_id=user.id, date=date, month=month)
     return {"tasks": [task.model_dump() for task in tasks]}
 
 
+def _ensure_day_task_owner(user: User, task_id: str):
+    """Return the task if visible to *user*; raise 404 otherwise."""
+    from app.services.calendar_service import get_daily_schedule_service
+    try:
+        task = get_daily_schedule_service().get_task(task_id)
+    except KeyError:
+        raise HTTPException(404, "day task not found")
+    if not user.is_admin and task.user_id != user.id:
+        raise HTTPException(404, "day task not found")
+    return task
+
+
 @app.post("/api/day-tasks", status_code=201)
-async def create_day_task(body: dict):
+async def create_day_task(body: dict, user: User = Depends(require_user)):
     from app.schemas.calendar import DayTaskCreate
     from app.services.calendar_service import get_daily_schedule_service
 
@@ -958,7 +1301,7 @@ async def create_day_task(body: dict):
     if not re.match(r"^\d{4}-\d{2}-\d{2}$", task_date):
         raise HTTPException(400, "task_date must be YYYY-MM-DD")
     task = get_daily_schedule_service().create_task(DayTaskCreate(
-        user_id=body.get("user_id") or "local",
+        user_id=user.id,
         task_date=task_date,
         start_time=body.get("start_time") or "09:00",
         end_time=body.get("end_time") or "10:00",
@@ -972,7 +1315,8 @@ async def create_day_task(body: dict):
 
 
 @app.put("/api/day-tasks/{task_id}")
-async def update_day_task(task_id: str, body: dict):
+async def update_day_task(task_id: str, body: dict, user: User = Depends(require_user)):
+    _ensure_day_task_owner(user, task_id)
     from app.schemas.calendar import DayTaskUpdate
     from app.services.calendar_service import get_daily_schedule_service
     try:
@@ -983,26 +1327,28 @@ async def update_day_task(task_id: str, body: dict):
 
 
 @app.delete("/api/day-tasks/{task_id}", status_code=204)
-async def delete_day_task(task_id: str):
+async def delete_day_task(task_id: str, user: User = Depends(require_user)):
+    _ensure_day_task_owner(user, task_id)
     from app.services.calendar_service import get_daily_schedule_service
     if not get_daily_schedule_service().delete_task(task_id):
         raise HTTPException(404, "day task not found")
 
 
 @app.post("/api/libraries", status_code=201)
-async def create_library(body: dict):
-    """Create a new named knowledge base. Body: {\"name\": \"...\"}"""
+async def create_library(body: dict, user: User = Depends(require_user)):
+    """Create a new named knowledge base owned by the current user."""
     name = (body.get("name") or "").strip()
     if not name:
         raise HTTPException(400, "name is required")
     from app.rag.long_term.store import get_lt_rag_store
-    lib_id = get_lt_rag_store().create_library(name)
+    lib_id = get_lt_rag_store().create_library(name, owner_user_id=user.id)
     return {"lib_id": lib_id, "name": name}
 
 
 @app.delete("/api/libraries/{lib_id}", status_code=204)
-async def delete_library(lib_id: str):
+async def delete_library(lib_id: str, user: User = Depends(require_user)):
     """Delete a knowledge base and all its documents."""
+    _ensure_library_owner(user, lib_id)
     from app.rag.long_term.store import get_lt_rag_store
     try:
         await get_lt_rag_store().delete_library(lib_id)
@@ -1011,21 +1357,26 @@ async def delete_library(lib_id: str):
 
 
 @app.post("/api/figure/upload")
-async def upload_figure_paper(file: UploadFile, session_id: str = ""):
+async def upload_figure_paper(
+    file: UploadFile,
+    session_id: str = "",
+    user: User = Depends(require_user),
+):
     """Upload and parse a paper for figure-prompt generation."""
     if not session_id:
         raise HTTPException(400, "session_id query parameter is required")
+    _ensure_session_owner(user, session_id)
 
     filename = file.filename or "paper.pdf"
     ext = os.path.splitext(filename)[1].lower()
     if ext not in {".pdf", ".txt", ".md", ".text", ".rst"}:
         raise HTTPException(400, "Only PDF/TXT/MD files are supported for figure generation")
 
-    os.makedirs(_FIGURE_UPLOAD_DIR, exist_ok=True)
-    safe_name = f"{uuid.uuid4().hex[:8]}_{filename}"
-    dest = os.path.join(_FIGURE_UPLOAD_DIR, safe_name)
-    with open(dest, "wb") as fh:
-        fh.write(await file.read())
+    content = await file.read()
+    from app.services.storage_service import save_upload
+    _record, dest = save_upload(
+        user=user, content=content, original_name=filename, category="figure",
+    )
 
     try:
         from app.tools.pdf.backends import extract_any
@@ -1054,7 +1405,7 @@ async def upload_figure_paper(file: UploadFile, session_id: str = ""):
 
 
 @app.post("/api/figure/prompt")
-async def generate_figure_prompt(body: dict):
+async def generate_figure_prompt(body: dict, user: User = Depends(require_user)):
     """Use the text LLM to read paper context + user needs and produce an editable image prompt."""
     paper_id = str(body.get("paper_id") or "").strip()
     user_brief = str(body.get("brief") or "").strip()
@@ -1104,7 +1455,7 @@ async def generate_figure_prompt(body: dict):
 
 
 @app.post("/api/figure/generate")
-async def generate_figure_image(body: dict):
+async def generate_figure_image(body: dict, user: User = Depends(require_user)):
     """Generate a real raster image from a prompt and return a displayable image URL."""
     prompt_text = str(body.get("prompt") or "").strip()
     negative = str(body.get("negative") or "").strip()
@@ -1163,7 +1514,8 @@ async def download_figure_image(image_name: str):
 
 
 @app.get("/api/libraries/{lib_id}/documents")
-async def list_library_documents(lib_id: str):
+async def list_library_documents(lib_id: str, user: User = Depends(require_user)):
+    _ensure_library_owner(user, lib_id)
     from app.rag.long_term.store import get_lt_rag_store
     from app.services.note_service import get_note_service
     if lib_id == "lt_docs":
@@ -1174,7 +1526,8 @@ async def list_library_documents(lib_id: str):
 
 
 @app.get("/api/libraries/{lib_id}/documents/file")
-async def read_library_document(lib_id: str, title: str):
+async def read_library_document(lib_id: str, title: str, user: User = Depends(require_user)):
+    _ensure_library_owner(user, lib_id)
     """Serve the original file for a long-term library document."""
     from app.rag.long_term.store import get_lt_rag_store
     from app.services.note_service import get_note_service
@@ -1229,8 +1582,10 @@ async def read_library_document(lib_id: str, title: str):
 
 
 @app.get("/api/libraries/{lib_id}/documents/chunks")
-async def list_library_document_chunks(lib_id: str, title: str, limit: int = 500):
+async def list_library_document_chunks(lib_id: str, title: str, limit: int = 500,
+                                        user: User = Depends(require_user)):
     """Return the actual indexed chunks for one long-term library document."""
+    _ensure_library_owner(user, lib_id)
     title = (title or "").strip()
     if not title:
         raise HTTPException(400, "title is required")
@@ -1254,13 +1609,12 @@ async def list_library_document_chunks(lib_id: str, title: str, limit: int = 500
 
 
 @app.post("/api/library_qa")
-async def library_qa(body: dict):
-    """Ask one indexed library document via retrieval_agent + reading_agent.
+async def library_qa(body: dict, user: User = Depends(require_user)):
+    """Ask one indexed library document via rag_agent.
 
     The frontend supplies only paper_id/question/session_id. PDF extraction and
     chunk retrieval remain backend responsibilities.
     """
-    from app.schemas.agent import AgentInput, AgentStatus
     from app.state.task_state import TaskState
 
     paper_id = str(body.get("paper_id") or body.get("paperId") or "").strip()
@@ -1276,6 +1630,8 @@ async def library_qa(body: dict):
     doc = await _resolve_library_qa_document(paper_id)
     if not doc:
         raise HTTPException(404, "paper is not indexed in the knowledge base")
+    # Ensure the target library belongs to the caller (or admin).
+    _ensure_library_owner(user, doc.get("lib_id") or "lt_docs")
 
     mem = _get_mem(session_id)
     scoped_question = f"针对《{doc['title']}》：{question}"
@@ -1294,32 +1650,14 @@ async def library_qa(body: dict):
         and _same_library_qa_target(mem.short_term.current_library_context, doc)
     )
 
-    if not use_cached:
-        retrieval_input = AgentInput(
-            task_id=state.task_id,
-            session_id=session_id,
-            agent_name="retrieval_agent",
-            user_goal=scoped_question,
-            current_stage="retrieval",
-            input_data={"question": scoped_question},
-        )
-        retrieval_output = await _orch._agents["retrieval_agent"].run(retrieval_input, state)
-        state.record_agent_output("retrieval_agent", retrieval_output.model_dump())
-        if retrieval_output.status == AgentStatus.FAILED:
-            message = retrieval_output.errors[0] if retrieval_output.errors else "retrieval failed"
-            return {
-                "session_id": session_id,
-                "answer": message,
-                "sources": [],
-                "paper": doc,
-            }
+    from app.schemas.agent import AgentInput, AgentStatus
 
-    reading_input = AgentInput(
+    rag_input = AgentInput(
         task_id=state.task_id,
         session_id=session_id,
-        agent_name="reading_agent",
+        agent_name="rag_agent",
         user_goal=scoped_question,
-        current_stage="paper_reading",
+        current_stage="question_answer",
         input_data={
             "documents": [],
             "question": scoped_question,
@@ -1327,10 +1665,10 @@ async def library_qa(body: dict):
             "cached_library_context": mem.short_term.current_library_context if use_cached else {},
         },
     )
-    reading_output = await _orch._agents["reading_agent"].run(reading_input, state)
-    state.record_agent_output("reading_agent", reading_output.model_dump())
-    if reading_output.status == AgentStatus.FAILED:
-        message = reading_output.errors[0] if reading_output.errors else "reading failed"
+    rag_output = await _orch._agents["rag_agent"].run(rag_input, state)
+    state.record_agent_output("rag_agent", rag_output.model_dump())
+    if rag_output.status == AgentStatus.FAILED:
+        message = rag_output.errors[0] if rag_output.errors else "rag failed"
         return {
             "session_id": session_id,
             "answer": message,
@@ -1339,7 +1677,8 @@ async def library_qa(body: dict):
         }
 
     retrieval_result = state.agent_outputs.get("retrieval_agent", {}).get("result", {})
-    reading_result = reading_output.result
+    reading_result = state.agent_outputs.get("reading_agent", {}).get("result", {})
+    rag_result = rag_output.result
     if retrieval_result:
         mem.short_term.current_library_context = {
             "contexts": retrieval_result.get("contexts", []),
@@ -1439,18 +1778,28 @@ def _library_qa_sources(retrieval_result: dict, reading_result: dict) -> list[di
     return sources
 
 
+def _annot_visible(user: User, ann: dict) -> bool:
+    """Admin sees everything; otherwise the annotation's user_id must match."""
+    if user.is_admin:
+        return True
+    return (ann.get("user_id") or "") == user.id
+
+
 @app.get("/api/reading/annotations")
-async def list_reading_annotations(doc_id: str):
+async def list_reading_annotations(doc_id: str, user: User = Depends(require_user)):
     doc_id = (doc_id or "").strip()
     if not doc_id:
         raise HTTPException(400, "doc_id is required")
-    items = [a for a in _reading_annotations() if a.get("doc_id") == doc_id]
+    items = [
+        a for a in _reading_annotations()
+        if a.get("doc_id") == doc_id and _annot_visible(user, a)
+    ]
     items.sort(key=lambda a: (int(a.get("page") or 0), a.get("created_at") or ""))
     return {"doc_id": doc_id, "annotations": items}
 
 
 @app.post("/api/reading/annotations")
-async def create_reading_annotation(body: dict):
+async def create_reading_annotation(body: dict, user: User = Depends(require_user)):
     doc_id = str(body.get("doc_id") or "").strip()
     selected_text = str(body.get("selected_text") or "").strip()
     rects = body.get("rects") or []
@@ -1466,6 +1815,7 @@ async def create_reading_annotation(body: dict):
     now = datetime.now(timezone.utc).isoformat()
     item = {
         "id": f"ann_{uuid.uuid4().hex[:12]}",
+        "user_id": user.id,
         "doc_id": doc_id,
         "title": str(body.get("title") or ""),
         "source_url": str(body.get("source_url") or ""),
@@ -1485,10 +1835,11 @@ async def create_reading_annotation(body: dict):
 
 
 @app.patch("/api/reading/annotations/{annotation_id}")
-async def update_reading_annotation(annotation_id: str, body: dict):
+async def update_reading_annotation(annotation_id: str, body: dict,
+                                     user: User = Depends(require_user)):
     data = _reading_annotations()
     item = next((a for a in data if a.get("id") == annotation_id), None)
-    if not item:
+    if not item or not _annot_visible(user, item):
         raise HTTPException(404, "annotation not found")
 
     from datetime import datetime, timezone
@@ -1502,24 +1853,32 @@ async def update_reading_annotation(annotation_id: str, body: dict):
 
 
 @app.delete("/api/reading/annotations/{annotation_id}", status_code=204)
-async def delete_reading_annotation(annotation_id: str):
+async def delete_reading_annotation(annotation_id: str, user: User = Depends(require_user)):
     data = _reading_annotations()
-    next_data = [a for a in data if a.get("id") != annotation_id]
-    if len(next_data) == len(data):
+    item = next((a for a in data if a.get("id") == annotation_id), None)
+    if not item or not _annot_visible(user, item):
         raise HTTPException(404, "annotation not found")
+    next_data = [a for a in data if a.get("id") != annotation_id]
     _write_json_file(_ANNOTATIONS_FILE, next_data)
 
 
+def _progress_key(user_id: str, doc_id: str) -> str:
+    """Composite key keeps each user's reading position separate per doc."""
+    return f"{user_id}::{doc_id}"
+
+
 @app.get("/api/reading/progress")
-async def get_reading_progress(doc_id: str):
+async def get_reading_progress(doc_id: str, user: User = Depends(require_user)):
     doc_id = (doc_id or "").strip()
     if not doc_id:
         raise HTTPException(400, "doc_id is required")
-    return {"doc_id": doc_id, "progress": _reading_progress().get(doc_id, {})}
+    data = _reading_progress()
+    record = data.get(_progress_key(user.id, doc_id)) or {}
+    return {"doc_id": doc_id, "progress": record}
 
 
 @app.post("/api/reading/progress")
-async def save_reading_progress(body: dict):
+async def save_reading_progress(body: dict, user: User = Depends(require_user)):
     doc_id = str(body.get("doc_id") or "").strip()
     if not doc_id:
         raise HTTPException(400, "doc_id is required")
@@ -1527,18 +1886,21 @@ async def save_reading_progress(body: dict):
     from datetime import datetime, timezone
 
     data = _reading_progress()
-    data[doc_id] = {
+    record = {
+        "user_id": user.id,
+        "doc_id": doc_id,
         "page": max(1, int(body.get("page") or 1)),
         "scale": float(body.get("scale") or 1),
         "scroll_top": max(0, int(body.get("scroll_top") or 0)),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
+    data[_progress_key(user.id, doc_id)] = record
     _write_json_file(_READING_PROGRESS_FILE, data)
-    return {"doc_id": doc_id, "progress": data[doc_id]}
+    return {"doc_id": doc_id, "progress": record}
 
 
 @app.post("/api/reading/translate")
-async def translate_reading_selection(body: dict):
+async def translate_reading_selection(body: dict, user: User = Depends(require_user)):
     text = str(body.get("text") or "").strip()
     target_lang = str(body.get("target_lang") or "中文").strip() or "中文"
     title = str(body.get("title") or "").strip()
@@ -1579,8 +1941,9 @@ async def translate_reading_selection(body: dict):
 
 
 @app.delete("/api/libraries/{lib_id}/documents", status_code=204)
-async def delete_library_document(lib_id: str, body: dict):
+async def delete_library_document(lib_id: str, body: dict, user: User = Depends(require_user)):
     """Remove one document. Body: {\"title\": \"...\"}"""
+    _ensure_library_owner(user, lib_id)
     title = (body.get("title") or "").strip()
     source_filter = (body.get("source") or "").strip()
     if not title and not source_filter:
@@ -1618,10 +1981,12 @@ async def upload_file(
     lib_id: str = "",
     chunk_size: int = 0,
     chunk_overlap: int = -1,
+    user: User = Depends(require_user),
 ):
     """Accept a PDF or text file, save it, and register it in the session."""
     if not session_id:
         raise HTTPException(400, "session_id query parameter is required")
+    _ensure_session_owner(user, session_id)
 
     filename = file.filename or "document"
     ext = os.path.splitext(filename)[1].lower()
@@ -1630,13 +1995,11 @@ async def upload_file(
             400, f"Unsupported file type '{ext}'. Allowed: {sorted(_ALLOWED_EXTS)}"
         )
 
-    os.makedirs(_UPLOAD_DIR, exist_ok=True)
-    safe_name = f"{uuid.uuid4().hex[:8]}_{filename}"
-    dest = os.path.join(_UPLOAD_DIR, safe_name)
-
     content = await file.read()
-    with open(dest, "wb") as fh:
-        fh.write(content)
+    from app.services.storage_service import save_upload
+    _record, dest = save_upload(
+        user=user, content=content, original_name=filename, category="upload"
+    )
 
     chunks_indexed = 0
     embed_error    = ""
@@ -1651,6 +2014,7 @@ async def upload_file(
 
     # If a lib_id is specified, embed immediately into that knowledge base
     if lib_id:
+        _ensure_library_owner(user, lib_id)
         try:
             from app.rag.long_term.store import get_lt_rag_store
             chunks_indexed = await get_lt_rag_store().add_document(
@@ -1702,10 +2066,15 @@ async def upload_file(
 
 
 @app.post("/api/image/upload")
-async def upload_image(file: UploadFile, session_id: str = ""):
+async def upload_image(
+    file: UploadFile,
+    session_id: str = "",
+    user: User = Depends(require_user),
+):
     """Accept an image for the image understanding tool."""
     if not session_id:
         raise HTTPException(400, "session_id query parameter is required")
+    _ensure_session_owner(user, session_id)
 
     filename = file.filename or "image"
     ext = os.path.splitext(filename)[1].lower()
@@ -1718,11 +2087,11 @@ async def upload_image(file: UploadFile, session_id: str = ""):
     if len(content) > 10 * 1024 * 1024:
         raise HTTPException(400, "image is too large; max size is 10MB")
 
-    os.makedirs(_IMAGE_UPLOAD_DIR, exist_ok=True)
-    safe_name = f"{uuid.uuid4().hex[:8]}_{os.path.basename(filename)}"
-    dest = os.path.join(_IMAGE_UPLOAD_DIR, safe_name)
-    with open(dest, "wb") as fh:
-        fh.write(content)
+    from app.services.storage_service import save_upload
+    _record, dest = save_upload(
+        user=user, content=content, original_name=filename, category="image",
+    )
+    safe_name = os.path.relpath(dest, _IMAGE_UPLOAD_DIR).replace(os.sep, "/")
 
     return {
         "success": True,
@@ -1732,21 +2101,23 @@ async def upload_image(file: UploadFile, session_id: str = ""):
     }
 
 
-@app.get("/api/image/uploads/{image_name}")
-async def get_uploaded_image(image_name: str):
-    ext = os.path.splitext(image_name)[1].lower()
+@app.get("/api/image/uploads/{image_path:path}")
+async def get_uploaded_image(image_path: str):
+    """Serve uploaded image. *image_path* may include a `{user_id}/` segment."""
+    ext = os.path.splitext(image_path)[1].lower()
     if ext not in _ALLOWED_IMAGE_EXTS:
         raise HTTPException(400, "unsupported image type")
-    safe = os.path.basename(image_name)
-    path = os.path.abspath(os.path.join(_IMAGE_UPLOAD_DIR, safe))
+    # Normalise + clamp to the image upload root to block traversal
+    norm = image_path.replace("\\", "/").lstrip("/")
+    path = os.path.abspath(os.path.join(_IMAGE_UPLOAD_DIR, norm))
     root = os.path.abspath(_IMAGE_UPLOAD_DIR)
     if os.path.commonpath([root, path]) != root or not os.path.exists(path):
         raise HTTPException(404, "image not found")
-    return FileResponse(path, filename=safe, media_type=mimetypes.guess_type(path)[0] or "image/png")
+    return FileResponse(path, filename=os.path.basename(path), media_type=mimetypes.guess_type(path)[0] or "image/png")
 
 
 @app.post("/api/image/analyze")
-async def analyze_uploaded_image(body: dict):
+async def analyze_uploaded_image(body: dict, user: User = Depends(require_user)):
     image_path = str(body.get("image_path") or "").strip()
     if not image_path:
         raise HTTPException(400, "image_path is required")
@@ -1768,8 +2139,13 @@ async def analyze_uploaded_image(body: dict):
 
 @app.websocket("/ws")
 async def websocket_chat(ws: WebSocket):
+    user = await require_user_ws(ws)
+    if user is None:
+        # 4401 is a custom close code the frontend treats as "redirect to login"
+        await ws.close(code=4401, reason="unauthorized")
+        return
     await ws.accept()
-    logger.info("WebSocket connected")
+    logger.info("WebSocket connected for user %s", user.id)
     try:
         while True:
             raw  = await ws.receive_text()
@@ -1780,11 +2156,28 @@ async def websocket_chat(ws: WebSocket):
             if not user_text or not sid:
                 continue
 
+            # Ownership: legacy/unstamped sessions get claimed for the current user;
+            # otherwise must match (admins bypass).
+            owner = _session_owner_id(sid)
+            if owner and not user.is_admin and owner != user.id:
+                await ws.send_text(json.dumps({"type": "error", "text": "无权访问该会话"}))
+                continue
+
             async def send_progress(payload: dict):
+                # Side-channel events (currently ResearchAgent's plan
+                # checkpoint) carry a `data` block with its own `type`;
+                # forward those as a dedicated WS message so the chat UI
+                # can render a plan card instead of a progress line.
+                data = payload.get("data") if isinstance(payload, dict) else None
+                if isinstance(data, dict) and data.get("type") == "research_plan_checkpoint":
+                    await ws.send_text(json.dumps({"type": "research_plan_checkpoint", **data}))
+                    return
                 await ws.send_text(json.dumps({"type": "status", **payload}))
 
             await send_progress({"step": "start", "text": "接收问题，准备分析任务", "pct": 5})
             mem = _get_mem(sid)
+            if not mem.short_term.owner_user_id:
+                _stamp_session_owner(mem, user)
             run_text = user_text
 
             if image_path:
@@ -1902,13 +2295,13 @@ async def _build_response(state, mem: MemoryManager) -> dict:
 
     if lib := state.agent_outputs.get("library_agent", {}):
         reply = lib.get("result", {}).get("reply", "")
+    elif research := state.agent_outputs.get("research_agent", {}):
+        reply = research.get("result", {}).get("reply", "")
     elif general := state.agent_outputs.get("general_agent", {}):
         reply = general.get("result", {}).get("reply", "")
     elif writing := state.agent_outputs.get("writing_agent", {}):
         r = writing.get("result", {})
         reply = _format_writing_reply(r)
-    elif chat := state.agent_outputs.get("chat_agent", {}):
-        reply = chat.get("result", {}).get("reply", "")
     elif web := state.agent_outputs.get("web_agent", {}):
         notes = web.get("result", {}).get("web_notes", [])
         if notes:
@@ -1928,6 +2321,8 @@ async def _build_response(state, mem: MemoryManager) -> dict:
     lit = state.agent_outputs.get("literature_agent", {})
     if lit:
         r = lit.get("result", {})
+        if r.get("reply"):
+            reply = r.get("reply", "")
         if user_intent in {"literature_search", "research_literature_reading"}:
             papers_found = r.get("selected_papers", [])
             if papers_found and not reply:

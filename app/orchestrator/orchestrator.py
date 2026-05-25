@@ -5,13 +5,12 @@ from typing import Awaitable, Callable, Optional
 
 from app.agents.base.agent import BaseAgent
 from app.config.settings import settings
-from app.agents.chat.agent import ChatAgent
 from app.agents.general.agent import GeneralAgent
 from app.agents.intent.agent import IntentAgent
 from app.agents.literature.agent import LiteratureAgent
 from app.agents.note.agent import NoteAgent
-from app.agents.reading.agent import ReadingAgent
-from app.agents.retrieval.agent import RetrievalAgent
+from app.agents.rag.agent import RagAgent
+from app.agents.research.agent import ResearchAgent
 from app.agents.summary.agent import SummaryAgent
 from app.agents.web.agent import WebAgent
 from app.agents.writing.agent import WritingAgent
@@ -27,9 +26,12 @@ from app.tools.download.tool import DownloadTool
 from app.tools.filter.tool import FilterTool
 from app.tools.image.analyze_image_tool import AnalyzeImageTool
 from app.tools.library.add_tool import AddToLibraryTool
+from app.tools.library.search_tool import LibrarySearchTool
+from app.tools.notes import ALL_NOTE_TOOLS
 from app.tools.pdf.tool import LlamaIndexTool
 from app.tools.search.tool import SearchTool
 from app.tools.web import UrlFetchTool, WebScrapeTool, WebSearchTool
+from app.orchestrator.actions import run_library_ingest_action, run_note_action
 from app.orchestrator.pending_action_handler import handle_pending_action
 from app.orchestrator.task_context import (
     apply_task_context_to_state,
@@ -41,8 +43,9 @@ from app.orchestrator.task_context import (
 from app.orchestrator.router import (
     extract_writing_source,
     has_uploaded_writing_docs,
+    # Kept for prompt hinting (not workflow routing).
     looks_like_library_query,
-    looks_like_web_read_query,
+    # Kept for paper_writing followup flag (not workflow routing).
     looks_like_writing_followup,
     paper_search_intent_from_query,
     resolve_workflow,
@@ -69,7 +72,6 @@ _STAGE_AGENT_MAP: dict[str, str] = {
     "web_reading": "web_agent",
     "web_done": "web_agent",
     "final_summary": "summary_agent",
-    "general_chat": "chat_agent",
 }
 
 
@@ -84,37 +86,62 @@ class Orchestrator:
 
     def _setup_tools(self) -> None:
         image_tool = AnalyzeImageTool()
+        # CRUD note operations exposed as standalone tools so a tool-calling
+        # agent (ResearchAgent / general_agent) can manage notes directly
+        # without going through note_agent / the note_action handler.
+        note_tools = [tool_cls() for tool_cls in ALL_NOTE_TOOLS]
         for tool in [
             SearchTool(),
             FilterTool(),
             DownloadTool(),
             LlamaIndexTool(),
             AddToLibraryTool(),
+            LibrarySearchTool(),
             WebSearchTool(),
             UrlFetchTool(),
             WebScrapeTool(),
             image_tool,
+            *note_tools,
         ]:
             ToolRegistry.register(tool)
+        # The literature_agent currently composes search_papers / filter_papers
+        # / download_pdf internally. As we move toward LLM tool-calling, expose
+        # the same tools under the canonical paper_* names so a generic
+        # research/general agent can address them directly without going
+        # through literature_agent.
+        ToolRegistry.register_alias("paper_search",   "search_papers")
+        ToolRegistry.register_alias("paper_filter",   "filter_papers")
+        ToolRegistry.register_alias("paper_download", "download_pdf")
+        # web_agent today wraps web_search → url_fetch → web_scrape internally.
+        # Expose the same web verbs cleanly so a tool-calling agent can compose
+        # them itself:
+        #   web_search → keep canonical name (lists URLs + snippets)
+        #   web_fetch  → alias of web_scrape (deep content from one URL)
+        #   url_fetch  → keep canonical (lightweight metadata to rank URLs)
+        ToolRegistry.register_alias("web_fetch", "web_scrape")
         image_tool.preheat_ocr()
-        logger.info("Registered tools: %s", ToolRegistry.list_names())
+        logger.info("Registered tools: %s", ToolRegistry.list_all_names())
 
     def _setup_agents(self) -> None:
         self._agent_llms = get_agent_llm_providers()
         fallback = self.llm
+        # Build agents; retrieval/reading have been inlined into rag_agent
         self._agents = {
             "intent_agent": IntentAgent(self._agent_llms.get("intent_agent", fallback)),
-            "general_agent": GeneralAgent(self._agent_llms.get("general_agent", self._agent_llms.get("chat_agent", fallback))),
+            "general_agent": GeneralAgent(self._agent_llms.get("general_agent", fallback)),
+            "research_agent": ResearchAgent(
+                self._agent_llms.get("research_agent", self._agent_llms.get("general_agent", fallback)),
+            ),
             "literature_agent": LiteratureAgent(self._agent_llms.get("literature_agent", fallback)),
-            "retrieval_agent": RetrievalAgent(self._agent_llms.get("retrieval_agent", fallback)),
-            "reading_agent": ReadingAgent(self._agent_llms.get("reading_agent", fallback)),
+            # RagAgent now inlines retrieval + reading logic; instantiated
+            # with a per-agent llm provider when available.
+            "rag_agent": RagAgent(self._agent_llms.get("rag_agent", fallback)),
             "web_agent": WebAgent(self._agent_llms.get("web_agent", self._agent_llms.get("reading_agent", fallback))),
             "writing_agent": WritingAgent(self._agent_llms.get("writing_agent", fallback)),
             "note_agent": NoteAgent(self._agent_llms.get("note_agent", fallback)),
             "summary_agent": SummaryAgent(self._agent_llms.get("summary_agent", fallback)),
-            "chat_agent": ChatAgent(self._agent_llms.get("chat_agent", fallback)),
         }
-        self.llm = self._agent_llms.get("chat_agent", fallback)
+        self.llm = self._agent_llms.get("general_agent", fallback)
         logger.info("Registered agents: %s", list(self._agents))
 
     def reload_llm_config(self) -> None:
@@ -132,9 +159,18 @@ class Orchestrator:
         memory_manager: Optional[MemoryManager] = None,
         progress_callback: Optional[Callable[[dict], Awaitable[None]]] = None,
     ) -> TaskState:
-        async def progress(step: str, text: str, pct: int | None = None) -> None:
+        async def progress(
+            step: str,
+            text: str,
+            pct: int | None = None,
+            *,
+            data: dict | None = None,
+        ) -> None:
             if progress_callback:
-                await progress_callback({"step": step, "text": text, "pct": pct})
+                payload = {"step": step, "text": text, "pct": pct}
+                if data is not None:
+                    payload["data"] = data
+                await progress_callback(payload)
 
         effective_session_id = session_id or f"session_{uuid.uuid4().hex[:8]}"
         session_context = self._load_session_context(effective_session_id, memory_manager)
@@ -147,6 +183,11 @@ class Orchestrator:
         )
         state.working_memory["conversation_history"] = conversation_history or session_context.recent_turns
         state.working_memory["session_context"] = session_context.to_dict()
+        # Stamp the session owner so downstream components (HITL resume
+        # endpoint, etc.) can do ownership checks without re-querying
+        # the session repo on every callback.
+        if memory_manager and getattr(memory_manager.short_term, "owner_user_id", ""):
+            state.working_memory["owner_user_id"] = memory_manager.short_term.owner_user_id
         if session_context.current_task:
             state.working_memory["current_task"] = session_context.current_task
         if session_context.history_summary:
@@ -225,10 +266,11 @@ class Orchestrator:
         intent_result = intent_output.result
         if intent_result.get("route") == "clarify" or intent_result.get("need_clarification"):
             question = intent_result.get("clarification_question") or "我需要再确认一下：你希望我具体处理哪一部分？"
-            state.workflow = "chat_workflow"
-            state.record_agent_output("chat_agent", {"result": {"reply": question}})
-            intent_result["workflow"] = "chat_workflow"
-            intent_result["user_intent"] = "general_chat"
+            # Clarification questions are emitted directly without dispatching a workflow.
+            state.workflow = "general_agent_workflow"
+            state.record_agent_output("general_agent", {"result": {"reply": question, "mode": "clarify"}})
+            intent_result["workflow"] = "general_agent_workflow"
+            intent_result["user_intent"] = "general_open_task"
             state.agent_outputs["intent_agent"]["result"] = intent_result
             state.update_stage("clarification_needed", "intent_agent")
             await progress("clarify", "需要先澄清任务目标", 90)
@@ -236,12 +278,34 @@ class Orchestrator:
             return state
 
         if _is_open_comparison_task(user_query, intent_result):
-            intent_result["route"] = "open_task"
-            intent_result["workflow"] = "general_agent_workflow"
-            intent_result["intent"] = "general_open_task"
-            intent_result["user_intent"] = "general_open_task"
-            intent_result["suggested_agent"] = "general_agent"
+            # Comparison across MULTIPLE papers needs tool orchestration
+            # (find them → fetch them → synthesise), which is exactly what
+            # ResearchAgent is for. Only fall back to general_agent when the
+            # papers are already loaded into the session (stored_papers).
+            if state.working_memory.get("stored_papers"):
+                intent_result["route"] = "open_task"
+                intent_result["workflow"] = "general_agent_workflow"
+                intent_result["intent"] = "general_open_task"
+                intent_result["user_intent"] = "general_open_task"
+                intent_result["suggested_agent"] = "general_agent"
+            else:
+                intent_result["route"] = "open_task"
+                intent_result["workflow"] = "research_agent_workflow"
+                intent_result["intent"] = "research_task"
+                intent_result["user_intent"] = "research_task"
+                intent_result["suggested_agent"] = "research_agent"
 
+        # ── Workflow decision ──────────────────────────────────────────────
+        # The Intent Agent has session_context in its prompt and is the
+        # single source of truth for natural-language routing. The only
+        # things that override its pick are:
+        #   * Explicit UI markers (ACADEMIC_WRITING=1, WRITING_SOURCE=,
+        #     IMAGE_PATH=)         — applied by resolve_workflow / below
+        #   * Active task continuation — keeps the user in their workflow
+        #
+        # Natural-language keyword overrides (looks_like_library_query,
+        # looks_like_web_read_query, etc.) used to live in this block and
+        # were the root cause of mid-task misrouting. They've been removed.
         workflow = resolve_workflow(intent_result, user_query, state)
         if task_relation == "continue_task":
             continued = continuation_workflow(active_task_context, user_query)
@@ -249,10 +313,14 @@ class Orchestrator:
                 workflow = continued
         if has_image_path_marker(user_query):
             workflow = "image_understanding_workflow"
+
         state.workflow = workflow
         required_agents = workflow_agent_plan(workflow, user_query, state)
         user_intent = workflow_intent_label_key(workflow, intent_result.get("user_intent", ""))
-        if intent_result.get("route") == "open_task" and workflow != "web_search_workflow":
+        if intent_result.get("route") == "open_task" and workflow not in {
+            "web_search_workflow",
+            "research_agent_workflow",  # ResearchAgent is a valid open-task target
+        }:
             workflow = "general_agent_workflow"
             user_intent = "general_open_task"
             required_agents = _general_open_task_plan(user_query, state)
@@ -263,29 +331,6 @@ class Orchestrator:
         intent_result["user_intent"] = user_intent
         intent_result["required_agents"] = required_agents
         writing_source = extract_writing_source(user_query)
-        if (
-            workflow != "general_agent_workflow"
-            and intent_result.get("route") != "open_task"
-            and library_query
-            and workflow not in {"kb_writing_workflow", "uploaded_file_writing_workflow"}
-        ):
-            user_intent = "library_qa"
-            workflow = "question_answer_workflow"
-            state.workflow = workflow
-            required_agents = ["retrieval_agent", "reading_agent"]
-            intent_result["workflow"] = workflow
-            intent_result["user_intent"] = "library_qa"
-            intent_result["required_agents"] = required_agents
-        elif (
-            should_use_cached_library_context(user_query, state)
-            and not state.working_memory.get("stored_papers")
-        ):
-            user_intent = "library_qa"
-            required_agents = ["reading_agent"]
-            state.working_memory["library_qa_mode"] = True
-            state.working_memory["use_cached_library_context"] = True
-            intent_result["user_intent"] = "library_qa"
-            intent_result["required_agents"] = required_agents
 
         # ── Intent routing ────────────────────────────────────────────────────
         await progress("route", f"已识别意图：{_intent_label(user_intent)}", 22)
@@ -313,21 +358,20 @@ class Orchestrator:
             state.working_memory["pre_selected_papers"] = pre_selected
 
         elif user_intent == "research_literature_reading":
-            required_agents = ["literature_agent", "reading_agent"]
+            required_agents = ["literature_agent", "rag_agent"]
             state.working_memory["max_papers"] = 1
 
         elif user_intent == "paper_qa":
+            # All paths now go through rag_agent. It internally decides
+            # whether retrieval is needed based on qa_source / library_qa_mode.
             if state.working_memory.get("qa_source") == "uploaded_file" or state.working_memory.get("stored_papers"):
-                required_agents = ["reading_agent"]
+                pass  # rag_agent will skip retrieval, read uploads directly
             elif should_use_cached_library_context(user_query, state):
-                required_agents = ["reading_agent"]
                 state.working_memory["library_qa_mode"] = True
                 state.working_memory["use_cached_library_context"] = True
             else:
-                # No downloaded PDFs in this session — fall back to library search.
-                # RetrievalAgent will surface a clear error if the library is also empty.
-                required_agents = ["retrieval_agent", "reading_agent"]
                 state.working_memory["library_qa_mode"] = True
+            required_agents = ["rag_agent"]
 
         elif user_intent == "summarize_session":
             required_agents = ["summary_agent"]
@@ -343,7 +387,7 @@ class Orchestrator:
                 if writing_source == "upload":
                     required_agents = ["writing_agent"]
                 elif writing_source == "library":
-                    required_agents = ["retrieval_agent", "reading_agent", "writing_agent"]
+                    required_agents = ["rag_agent", "writing_agent"]
                 elif writing_source == "rewrite":
                     required_agents = ["writing_agent"]
                 else:
@@ -357,10 +401,10 @@ class Orchestrator:
                     if has_uploads and wants_uploads:
                         required_agents = ["writing_agent"]
                     elif intent_result.get("need_retrieval", intent_result.get("use_retrieval", True)):
-                        required_agents = ["retrieval_agent", "reading_agent", "writing_agent"]
+                        required_agents = ["rag_agent", "writing_agent"]
                     else:
                         required_agents = ["writing_agent"]
-                if "retrieval_agent" in required_agents:
+                if "rag_agent" in required_agents:
                     state.working_memory["library_qa_mode"] = True
                 state.working_memory["writing_source"] = writing_source or "auto"
 
@@ -378,19 +422,24 @@ class Orchestrator:
             intent_result["workflow"] = workflow
             intent_result["required_agents"] = required_agents
 
+        elif user_intent == "research_task":
+            # ResearchAgent owns the whole loop — no other agents in the plan.
+            workflow = "research_agent_workflow"
+            state.workflow = workflow
+            required_agents = ["research_agent"]
+            intent_result["workflow"] = workflow
+            intent_result["required_agents"] = required_agents
+
         # ── New: personal library management ─────────────────────────────────
 
         elif user_intent == "add_to_library":
             required_agents = []
 
         elif user_intent == "library_qa":
-            if state.working_memory.get("qa_source") == "uploaded_file":
-                required_agents = ["reading_agent"]
-            elif should_use_cached_library_context(user_query, state):
-                required_agents = ["reading_agent"]
+            # rag_agent now covers both retrieval+reading and standalone reading.
+            if should_use_cached_library_context(user_query, state):
                 state.working_memory["use_cached_library_context"] = True
-            else:
-                required_agents = ["retrieval_agent", "reading_agent"]
+            required_agents = ["rag_agent"]
             state.working_memory["library_qa_mode"] = True
 
         elif user_intent == "clear_temp_rag":
@@ -404,16 +453,26 @@ class Orchestrator:
         state.agent_outputs["intent_agent"]["result"] = intent_result
         await progress("plan", f"执行计划：{_agent_plan_label(required_agents)}", 30)
 
-        # Step 2: Execute the selected workflow through LangGraph.
-        state = await run_agent_workflow(
-            workflow_name=workflow,
-            task_state=state,
-            user_query=user_query,
-            agent_names=required_agents,
-            agents=self._agents,
-            build_agent_input=self._build_agent_input,
-            progress=progress,
-        )
+        # Step 2: Execute. Most workflows run through LangGraph, but a couple of
+        # deterministic ones (library ingest, note CRUD) were demoted to direct
+        # action handlers — no branching reasoning to justify a graph. See
+        # app/orchestrator/actions.py.
+        if workflow == "library_ingest_action":
+            state = await run_library_ingest_action(state, progress)
+        elif workflow == "note_action":
+            state = await run_note_action(
+                state, self._agents, self._build_agent_input, progress
+            )
+        else:
+            state = await run_agent_workflow(
+                workflow_name=workflow,
+                task_state=state,
+                user_query=user_query,
+                agent_names=required_agents,
+                agents=self._agents,
+                build_agent_input=self._build_agent_input,
+                progress=progress,
+            )
 
         if workflow == "paper_search_workflow" and state.working_memory.get("search_only") and not state.pending_action:
             papers = state.agent_outputs.get("literature_agent", {}).get("result", {}).get("selected_papers", [])
@@ -542,11 +601,6 @@ class Orchestrator:
             else:
                 material_chunks = retrieval_result.get("retrieved_chunks", [])
             input_data = {
-                "user_query": user_goal,
-                "writing_task_type": intent_result.get("writing_task_type", "literature_review"),
-                "retrieved_chunks": material_chunks,
-                "retrieval_summary": state.working_memory.get("writing_material_summary") or _build_retrieval_summary(retrieval_result),
-                "constraints": intent_result.get("constraints", {}),
                 "user_extra_instruction": intent_result.get("user_extra_instruction", ""),
                 "user_provided_material": state.working_memory.get("user_provided_writing_material", ""),
                 "source_policy": state.working_memory.get("writing_source_policy", ""),
@@ -561,11 +615,6 @@ class Orchestrator:
                 "conversation_history": state.working_memory.get("conversation_history", []),
                 "agent_outputs": state.agent_outputs,
                 "user_id": "local",
-            }
-        elif agent_name == "chat_agent":
-            input_data = {
-                "user_message": user_goal,
-                "conversation_history": state.working_memory.get("conversation_history", []),
             }
         elif agent_name == "general_agent":
             input_data = {
@@ -667,8 +716,6 @@ def _summarize_agent_result(agent_name: str, result: dict) -> str:
         return str(result.get("final_report") or "")[:1500]
     if agent_name == "note_agent":
         return str(result.get("reply") or result.get("content") or "")[:1000]
-    if agent_name == "chat_agent":
-        return str(result.get("reply") or "")[:1000]
     return str(result.get("reply") or result.get("content") or result)[:1000]
 
 
@@ -886,16 +933,16 @@ def _general_open_task_plan(user_query: str, state: TaskState) -> list[str]:
 
     if any(marker in q for marker in library_markers):
         state.working_memory["library_qa_mode"] = True
-        agents.extend(["retrieval_agent", "reading_agent"])
+        agents.append("rag_agent")
     elif any(marker in q for marker in paper_support_markers):
         state.working_memory["search_only"] = True
         agents.append("literature_agent")
     elif state.working_memory.get("stored_papers") and any(marker in q for marker in stored_paper_markers):
-        agents.append("reading_agent")
+        agents.append("rag_agent")
     elif state.working_memory.get("stored_papers") and any(
         marker in q for marker in ["这篇", "这个文件", "这份", "this paper", "this file", "pdf"]
     ):
-        agents.append("reading_agent")
+        agents.append("rag_agent")
 
     agents.append("general_agent")
     return list(dict.fromkeys(agents))
@@ -958,7 +1005,6 @@ def _agent_short_name(agent_name: str) -> str:
         "web_agent": "网页搜索阅读",
         "note_agent": "笔记",
         "summary_agent": "总结",
-        "chat_agent": "回答",
         "analyze_image": "图片分析",
     }
     return labels.get(agent_name, agent_name)
@@ -972,7 +1018,6 @@ def _agent_running_text(agent_name: str) -> str:
         "web_agent": "正在搜索网页、抓取正文并综合回答",
         "note_agent": "正在处理笔记内容",
         "summary_agent": "正在压缩上下文并生成总结",
-        "chat_agent": "正在组织回答",
     }
     return labels.get(agent_name, f"正在运行 {agent_name}")
 
@@ -985,6 +1030,5 @@ def _agent_done_text(agent_name: str) -> str:
         "web_agent": "网页搜索阅读完成",
         "note_agent": "笔记处理完成",
         "summary_agent": "总结生成完成",
-        "chat_agent": "回答生成完成",
     }
     return labels.get(agent_name, f"{agent_name} 完成")

@@ -83,11 +83,13 @@ class AgentService:
 def collect_agent_reply(state) -> str:
     if lib := state.agent_outputs.get("library_agent", {}):
         return lib.get("result", {}).get("reply", "")
+    if research := state.agent_outputs.get("research_agent", {}):
+        return research.get("result", {}).get("reply", "")
+    if general := state.agent_outputs.get("general_agent", {}):
+        return general.get("result", {}).get("reply", "")
     if writing := state.agent_outputs.get("writing_agent", {}):
         result = writing.get("result", {})
         return result.get("content") or result.get("reply") or ""
-    if chat := state.agent_outputs.get("chat_agent", {}):
-        return chat.get("result", {}).get("reply", "")
     if read := state.agent_outputs.get("reading_agent", {}):
         notes = read.get("result", {}).get("reading_notes", [])
         return "\n\n---\n\n".join(
@@ -102,6 +104,8 @@ def collect_agent_reply(state) -> str:
     lit = state.agent_outputs.get("literature_agent", {})
     if lit:
         result = lit.get("result", {})
+        if result.get("reply"):
+            return result.get("reply", "")
         papers = result.get("selected_papers", [])
         if papers:
             return format_paper_search_reply(papers)

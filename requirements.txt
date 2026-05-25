@@ -26,6 +26,10 @@ chromadb>=0.5.0
 # Text splitting
 langchain-text-splitters>=0.3.0
 langgraph>=0.2.0
+# Postgres-backed checkpointer for ResearchAgent's 3-node graph. Persists
+# state at every node boundary so plan→execute→synthesize can be paused
+# and resumed (Phase D HITL).
+langgraph-checkpoint-postgres>=2.0.0
 
 # Optional RAG evaluation backend (set EVAL_BACKEND=ragas)
 # ragas>=0.2.0
@@ -49,6 +53,12 @@ pywebview>=5.0
 
 # PostgreSQL note storage
 psycopg[binary]>=3.1.18
+
+# Auth (PR-1: email/password + JWT; PR-2/3: phone + QQ)
+bcrypt>=4.0.0
+python-jose[cryptography]>=3.3.0
+aiosmtplib>=3.0.0
+email-validator>=2.1.0
 
 # To be enabled later:
 # redis>=5.0.0

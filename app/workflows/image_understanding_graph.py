@@ -29,10 +29,10 @@ def build_image_understanding_graph(
     builder = StateGraph(AgentWorkflowState)
     builder.add_node("analyze_image", _analyze_image_node(progress))
     builder.add_node(
-        "chat_agent",
+        "general_agent",
         make_agent_node(
             workflow_name=workflow_name,
-            agent_name="chat_agent",
+            agent_name="general_agent",
             agents=agents,
             build_agent_input=build_agent_input,
             progress=progress,
@@ -43,11 +43,11 @@ def build_image_understanding_graph(
         "analyze_image",
         continue_or_end,
         {
-            "continue": "chat_agent",
+            "continue": "general_agent",
             "end": END,
         },
     )
-    builder.add_edge("chat_agent", END)
+    builder.add_edge("general_agent", END)
     return builder.compile()
 
 
@@ -58,7 +58,7 @@ def _analyze_image_node(progress: ProgressCallback):
         image_path = extract_image_path(user_query)
         clean_query = strip_image_path_marker(user_query)
 
-        state["agent_names"] = ["analyze_image", "chat_agent"]
+        state["agent_names"] = ["analyze_image", "general_agent"]
         state["total_agents"] = 2
         state["done_agents"] = 0
 

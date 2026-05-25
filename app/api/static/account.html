@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>账号设置 — Research Assistant</title>
+<link rel="stylesheet" href="/auth.css">
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <linearGradient id="grad-back" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#AFA9EC"/><stop offset="100%" stop-color="#9B6FD4"/>
+    </linearGradient>
+    <linearGradient id="grad-front" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#534AB7"/><stop offset="60%" stop-color="#7B5FC0"/><stop offset="100%" stop-color="#1D9E75"/>
+    </linearGradient>
+  </defs>
+</svg>
+<div class="auth-shell">
+  <div class="auth-card wide">
+    <a class="auth-brand" href="/" aria-label="paipai home">
+      <svg class="logo-svg" width="38" height="38" viewBox="0 0 68 68">
+        <text class="p-back"  x="4"  y="54">p</text>
+        <text class="p-front" x="22" y="46">p</text>
+      </svg>
+      <span class="auth-brand-name">paipai</span>
+    </a>
+
+    <!-- Reset-password panel — shown only when URL hash is #reset?token=... -->
+    <section id="reset-panel" style="display:none">
+      <h1 class="auth-title">设置新密码</h1>
+      <p class="auth-subtitle">请设置一个新的登录密码（至少 8 位）</p>
+      <div id="reset-alert" class="alert hidden"></div>
+      <form id="reset-form" class="auth-form">
+        <div class="field">
+          <label for="new-password">新密码</label>
+          <input id="new-password" type="password" minlength="8" required>
+        </div>
+        <div class="field">
+          <label for="new-password-2">确认新密码</label>
+          <input id="new-password-2" type="password" minlength="8" required>
+        </div>
+        <button type="submit" id="reset-btn" class="btn btn-primary btn-block">重置密码</button>
+      </form>
+    </section>
+
+    <!-- Account panel — shown for logged-in users -->
+    <section id="account-panel" style="display:none">
+      <h1 class="auth-title">账号设置</h1>
+      <p class="auth-subtitle">管理你的登录方式与基本信息</p>
+
+      <div id="alert" class="alert hidden"></div>
+
+      <div style="display:flex;justify-content:space-between;align-items:center;margin:18px 0 6px">
+        <h3 style="font-size:15px;font-weight:700">基本信息</h3>
+      </div>
+      <div class="account-row">
+        <div class="meta">
+          <div class="meta-title" id="display-name">—</div>
+          <div class="meta-sub" id="user-id">—</div>
+        </div>
+        <div>
+          <a class="btn btn-secondary" href="/app">返回应用</a>
+        </div>
+      </div>
+
+      <div style="display:flex;justify-content:space-between;align-items:center;margin:18px 0 6px">
+        <h3 style="font-size:15px;font-weight:700">已绑定的登录方式</h3>
+      </div>
+      <div id="identities"></div>
+
+      <div style="margin-top:24px;display:flex;justify-content:flex-end">
+        <button id="logout-btn" class="btn-link-danger">退出登录</button>
+      </div>
+    </section>
+  </div>
+</div>
+
+<script src="/auth.js"></script>
+<script>
+const PROVIDER_LABEL = { email: '邮箱', phone: '手机号', qq: 'QQ' };
+
+function setAlert(elId, msg, type='error') {
+  const el = document.getElementById(elId);
+  el.className = 'alert ' + type;
+  el.textContent = msg;
+}
+function hideAlert(elId) {
+  document.getElementById(elId).className = 'alert hidden';
+}
+
+// ── Reset-password flow (when URL is /account#reset?token=...) ─────────────
+function parseHash() {
+  const m = location.hash.match(/^#reset\?token=(.+)$/);
+  return m ? decodeURIComponent(m[1]) : null;
+}
+
+const resetToken = parseHash();
+if (resetToken) {
+  document.getElementById('reset-panel').style.display = '';
+  document.getElementById('reset-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    hideAlert('reset-alert');
+    const a = document.getElementById('new-password').value;
+    const b = document.getElementById('new-password-2').value;
+    if (a !== b) { setAlert('reset-alert', '两次输入的密码不一致'); return; }
+    const btn = document.getElementById('reset-btn');
+    btn.disabled = true; btn.textContent = '提交中…';
+    try {
+      await Auth.resetPassword({ token: resetToken, new_password: a });
+      setAlert('reset-alert', '密码已重置，请使用新密码登录', 'ok');
+      setTimeout(() => location.assign('/login'), 1200);
+    } catch (err) {
+      setAlert('reset-alert', err.message || '重置失败');
+    } finally {
+      btn.disabled = false; btn.textContent = '重置密码';
+    }
+  });
+} else {
+  // ── Account panel ───────────────────────────────────────────────────────
+  document.getElementById('account-panel').style.display = '';
+
+  (async () => {
+    const me = await Auth.getMe();
+    if (!me || !me.user) { Auth.redirectToLogin(); return; }
+
+    document.getElementById('display-name').textContent = me.user.display_name;
+    document.getElementById('user-id').textContent = 'User ID · ' + me.user.id;
+
+    const list = document.getElementById('identities');
+    const identities = me.identities || [];
+    list.innerHTML = '';
+    identities.forEach(i => {
+      const row = document.createElement('div');
+      row.className = 'account-row';
+      const verifiedBadge = i.verified
+        ? '<span class="badge-verified">已验证</span>'
+        : '<span class="badge-pending">未验证</span>';
+      const canUnbind = identities.length > 1;
+      row.innerHTML = `
+        <div class="meta">
+          <div class="meta-title">${PROVIDER_LABEL[i.provider] || i.provider}${verifiedBadge}</div>
+          <div class="meta-sub">${i.provider_uid}</div>
+        </div>
+        <button class="btn-link-danger" data-id="${i.id}" ${canUnbind ? '' : 'disabled title="至少保留一个登录方式"'}>解绑</button>
+      `;
+      list.appendChild(row);
+    });
+    list.querySelectorAll('button[data-id]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        if (!confirm('确认解绑此登录方式吗？')) return;
+        try {
+          await Auth.unbindIdentity(btn.dataset.id);
+          location.reload();
+        } catch (err) {
+          setAlert('alert', err.message || '解绑失败');
+        }
+      });
+    });
+  })();
+
+  document.getElementById('logout-btn').addEventListener('click', async () => {
+    try { await Auth.logout(); } catch (_) {}
+    location.assign('/login');
+  });
+}
+</script>
+</body>
+</html>

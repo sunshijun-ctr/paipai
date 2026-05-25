@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>登录 — Research Assistant</title>
+<link rel="stylesheet" href="/auth.css">
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <linearGradient id="grad-back" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#AFA9EC"/><stop offset="100%" stop-color="#9B6FD4"/>
+    </linearGradient>
+    <linearGradient id="grad-front" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#534AB7"/><stop offset="60%" stop-color="#7B5FC0"/><stop offset="100%" stop-color="#1D9E75"/>
+    </linearGradient>
+  </defs>
+</svg>
+<div class="auth-shell">
+  <div class="auth-card">
+    <a class="auth-brand" href="/" aria-label="paipai home">
+      <svg class="logo-svg" width="38" height="38" viewBox="0 0 68 68">
+        <text class="p-back"  x="4"  y="54">p</text>
+        <text class="p-front" x="22" y="46">p</text>
+      </svg>
+      <span class="auth-brand-name">paipai</span>
+    </a>
+    <h1 class="auth-title">登录账号</h1>
+    <p class="auth-subtitle">欢迎回来，请输入你的账号信息</p>
+
+    <div class="auth-tabs" role="tablist">
+      <button class="auth-tab active" data-tab="email">邮箱</button>
+      <button class="auth-tab" data-tab="phone" disabled title="PR-2 上线">手机号</button>
+    </div>
+
+    <div id="alert" class="alert hidden" role="alert"></div>
+
+    <!-- Email login form -->
+    <form id="email-form" class="auth-form">
+      <div class="field">
+        <label for="email">邮箱</label>
+        <input id="email" type="email" autocomplete="email" required>
+      </div>
+      <div class="field">
+        <label for="password">密码</label>
+        <input id="password" type="password" autocomplete="current-password" required minlength="8">
+      </div>
+      <button type="submit" id="submit-btn" class="btn btn-primary btn-block">登录</button>
+      <div style="display:flex;justify-content:flex-end;font-size:13px">
+        <button type="button" id="forgot-btn" class="auth-link">忘记密码？</button>
+      </div>
+    </form>
+
+    <div class="auth-divider">第三方登录</div>
+    <div class="social-row">
+      <button class="social-btn" disabled title="PR-3 上线">QQ</button>
+      <button class="social-btn" disabled title="后续上线">微信</button>
+      <button class="social-btn" disabled title="PR-2 上线">手机</button>
+    </div>
+
+    <div class="auth-foot">
+      还没有账号？<a href="/register">立即注册</a>
+    </div>
+  </div>
+</div>
+
+<!-- Forgot-password modal (hidden by default) -->
+<dialog id="forgot-dialog" style="border:0;border-radius:14px;padding:0;max-width:420px">
+  <form id="forgot-form" style="padding:28px 28px 22px;font-family:inherit;font-size:14px">
+    <h3 style="margin-bottom:6px">找回密码</h3>
+    <p style="color:#6b7280;font-size:13px;margin-bottom:16px">输入注册邮箱，我们会发送一封带重置链接的邮件给你。</p>
+    <div class="field" style="margin-bottom:14px">
+      <label for="forgot-email">邮箱</label>
+      <input id="forgot-email" type="email" required>
+    </div>
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button type="button" id="forgot-cancel" class="btn btn-secondary">取消</button>
+      <button type="submit" class="btn btn-primary">发送链接</button>
+    </div>
+  </form>
+</dialog>
+
+<script src="/auth.js"></script>
+<script>
+const $alert = document.getElementById('alert');
+const $form = document.getElementById('email-form');
+const $btn = document.getElementById('submit-btn');
+const $forgot = document.getElementById('forgot-btn');
+const $dlg = document.getElementById('forgot-dialog');
+const $forgotForm = document.getElementById('forgot-form');
+const $forgotCancel = document.getElementById('forgot-cancel');
+
+function showAlert(msg, type='error') {
+  $alert.className = 'alert ' + type;
+  $alert.textContent = msg;
+}
+function hideAlert() { $alert.className = 'alert hidden'; }
+
+// If already logged in, jump straight to the app
+(async () => {
+  const me = await Auth.getMe().catch(() => null);
+  if (me && me.user) location.assign('/app');
+})();
+
+$form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  hideAlert();
+  $btn.disabled = true; $btn.textContent = '登录中…';
+  try {
+    const email = document.getElementById('email').value.trim();
+    const password = document.getElementById('password').value;
+    await Auth.loginEmail({ email, password });
+    const next = new URLSearchParams(location.search).get('next') || '/app';
+    location.assign(next);
+  } catch (err) {
+    showAlert(err.message || '登录失败', 'error');
+  } finally {
+    $btn.disabled = false; $btn.textContent = '登录';
+  }
+});
+
+$forgot.addEventListener('click', () => $dlg.showModal());
+$forgotCancel.addEventListener('click', () => $dlg.close());
+$forgotForm.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const email = document.getElementById('forgot-email').value.trim();
+  try {
+    await Auth.forgotPassword({ email });
+    $dlg.close();
+    showAlert('如果邮箱已注册，重置链接已发送，请查收', 'ok');
+  } catch (err) {
+    showAlert(err.message || '发送失败', 'error');
+  }
+});
+</script>
+</body>
+</html>

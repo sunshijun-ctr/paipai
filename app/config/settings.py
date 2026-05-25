@@ -48,12 +48,9 @@ class Settings(BaseSettings):
     general_agent_llm_provider: Optional[str] = None
     general_agent_llm_model: Optional[str] = None
     general_agent_api_key: Optional[str] = None
-    literature_agent_llm_provider: Optional[str] = None
-    literature_agent_llm_model: Optional[str] = None
-    literature_agent_api_key: Optional[str] = None
-    reading_agent_llm_provider: Optional[str] = None
-    reading_agent_llm_model: Optional[str] = None
-    reading_agent_api_key: Optional[str] = None
+    rag_agent_llm_provider: Optional[str] = None
+    rag_agent_llm_model: Optional[str] = None
+    rag_agent_api_key: Optional[str] = None
     web_agent_llm_provider: Optional[str] = None
     web_agent_llm_model: Optional[str] = None
     web_agent_api_key: Optional[str] = None
@@ -66,9 +63,6 @@ class Settings(BaseSettings):
     summary_agent_llm_provider: Optional[str] = None
     summary_agent_llm_model: Optional[str] = None
     summary_agent_api_key: Optional[str] = None
-    chat_agent_llm_provider: Optional[str] = None
-    chat_agent_llm_model: Optional[str] = None
-    chat_agent_api_key: Optional[str] = None
     evaluator_agent_llm_provider: Optional[str] = None
     evaluator_agent_llm_model: Optional[str] = None
     evaluator_agent_api_key: Optional[str] = None
@@ -138,6 +132,65 @@ class Settings(BaseSettings):
     app_name: str = "Research Assistant"
     debug: bool = False
     data_dir: str = "./data"
+
+    # Auth — JWT + cookies
+    auth_jwt_secret: str = "dev-secret-please-change-in-production"
+    auth_jwt_algorithm: str = "HS256"
+    auth_access_token_ttl_minutes: int = 15
+    auth_refresh_token_ttl_days: int = 7
+    auth_cookie_domain: Optional[str] = None
+    auth_cookie_secure: bool = False
+    auth_public_base_url: str = "http://localhost:8000"
+
+    # SMTP — email sending. Empty smtp_host → fall back to console output.
+    smtp_host: Optional[str] = None
+    smtp_port: int = 465
+    smtp_use_tls: bool = True
+    smtp_user: Optional[str] = None
+    smtp_password: Optional[str] = None
+    smtp_from_address: str = "noreply@example.com"
+    smtp_from_name: str = "Research Assistant"
+
+    # QQ OAuth (PR-3) — distinct from QQ_BOT_* (which is the bot SDK)
+    qq_oauth_app_id: Optional[str] = None
+    qq_oauth_app_key: Optional[str] = None
+    qq_oauth_redirect_uri: str = "http://localhost:8000/api/auth/qq/callback"
+
+    # Admin bootstrap — on startup, ensure this account exists and is_admin=true.
+    # Existing data without an owner is claimed by this account.
+    auth_admin_email: Optional[str] = None
+    auth_admin_initial_password: Optional[str] = None
+    auth_admin_display_name: str = "Admin"
+
+    # Per-user storage quota — 500MB default. Admin is exempt.
+    auth_storage_limit_bytes: int = 500 * 1024 * 1024
+    auth_max_upload_bytes: int = 100 * 1024 * 1024   # single-file cap, 100MB
+
+    # Password-reset rate limits (per email)
+    auth_reset_cooldown_seconds: int = 300   # min wait between two reset emails
+    auth_reset_daily_limit: int = 2          # max reset emails per rolling 24h
+
+    # ── ResearchAgent human-in-the-loop (Phase D) ──────────────────────
+    # When enabled, plans with ≥ research_hitl_min_steps pause and emit a
+    # plan-approval event to the WebSocket. The user can approve / modify
+    # / cancel; if no action within research_hitl_timeout_secs the plan
+    # is auto-approved and execution resumes.
+    research_hitl_enabled: bool = False
+    research_hitl_min_steps: int = 3
+    research_hitl_timeout_secs: int = 60
+
+    # ── Frontend error tracking (Phase-1 #1.4) ──────────────────────────
+    # When SENTRY_DSN is set, the chat page boots the Sentry browser SDK
+    # and reports uncaught JS errors / unhandled promise rejections.
+    # Leaving it empty disables the SDK entirely (safe default for dev).
+    # DSN is NOT a secret — Sentry treats it as a public project id.
+    sentry_dsn: Optional[str] = None
+
+    # Optional HTTP / HTTPS / SOCKS proxy for Tavily + Serper. Set this when
+    # running inside mainland China without direct reachability to
+    # api.tavily.com or google.serper.dev. The rest of the system (国产 LLM
+    # 等) bypasses it. Example: http://127.0.0.1:7890  or  socks5://127.0.0.1:1080
+    web_search_proxy: Optional[str] = None
 
     @field_validator("debug", mode="before")
     @classmethod

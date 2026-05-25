@@ -3,6 +3,7 @@ from typing import Awaitable, Callable
 
 from app.agents.base.agent import BaseAgent
 from app.memory.manager import MemoryManager
+from app.orchestrator.actions import run_note_action
 from app.schemas.agent import AgentInput
 from app.state.task_state import TaskState
 from app.workflows.executor import run_agent_workflow
@@ -114,21 +115,14 @@ async def _continue_save_note_choice(
     await progress("pending_note", "Saving summary to note...", 30)
     state.record_agent_output(
         "intent_agent",
-        {"result": {"user_intent": "create_note_from_summary", "workflow": "note_workflow"}},
+        {"result": {"user_intent": "create_note_from_summary", "workflow": "note_action"}},
     )
     state.record_agent_output("summary_agent", {"result": {"final_report": summary_text}})
     state.working_memory["pending_summary_text"] = summary_text
     memory_manager.short_term.pending_action = None
     state.pending_action = None
-    return await run_agent_workflow(
-        workflow_name="note_workflow",
-        task_state=state,
-        user_query=user_query,
-        agent_names=["note_agent"],
-        agents=agents,
-        build_agent_input=build_agent_input,
-        progress=progress,
-    )
+    # note_workflow was demoted to a direct action handler.
+    return await run_note_action(state, agents, build_agent_input, progress)
 
 
 def _finish_pending_with_reply(

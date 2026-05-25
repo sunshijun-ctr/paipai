@@ -222,7 +222,7 @@ def continuation_workflow(ctx: dict[str, Any] | None, user_message: str = "") ->
     if task_type == "paper_search":
         return "paper_search_workflow"
     if task_type == "note":
-        return "note_workflow"
+        return "note_action"
     return ctx.get("last_workflow", "")
 
 
@@ -250,7 +250,7 @@ def build_task_context_from_state(state: TaskState, assistant_reply: str = "") -
         _fill_reading_context(ctx, state, assistant_reply)
     elif workflow == "paper_search_workflow" or "literature_agent" in state.agent_outputs:
         _fill_search_context(ctx, state, assistant_reply)
-    elif workflow == "note_workflow" or "note_agent" in state.agent_outputs:
+    elif workflow == "note_action" or "note_agent" in state.agent_outputs:
         ctx["task_type"] = "note"
         ctx["subject_type"] = "note"
         ctx["subject_content"] = assistant_reply[:6000]

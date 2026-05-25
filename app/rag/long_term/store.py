@@ -111,21 +111,28 @@ class LongTermRAGStore:
 
     # ── Library management ────────────────────────────────────────────────────
 
-    def create_library(self, name: str) -> str:
-        """Create a new named library. Returns lib_id (idempotent by name)."""
+    def create_library(self, name: str, *, owner_user_id: str = "") -> str:
+        """Create a new named library, owned by *owner_user_id* if given.
+
+        Lookup-by-name is now per-owner: two different users may have a library
+        with the same display name."""
         reg = self._load_registry()
-        # Return existing if same name
+        # Return existing if same (owner, name)
         for lid, info in reg.items():
-            if info.get("name") == name:
+            if info.get("name") == name and (info.get("owner_user_id") or "") == owner_user_id:
                 return lid
         slug   = _lib_slug(name)
         lib_id = f"lib_{slug}"
         base, n = lib_id, 2
         while lib_id in reg:
             lib_id = f"{base}_{n}"; n += 1
-        reg[lib_id] = {"name": name, "created_at": datetime.now().isoformat()}
+        reg[lib_id] = {
+            "name": name,
+            "created_at": datetime.now().isoformat(),
+            "owner_user_id": owner_user_id or "",
+        }
         self._save_registry(reg)
-        logger.info("Created library '%s' → %s", name, lib_id)
+        logger.info("Created library '%s' → %s (owner=%s)", name, lib_id, owner_user_id or "—")
         return lib_id
 
     async def delete_library(self, lib_id: str) -> None:
@@ -143,14 +150,33 @@ class LongTermRAGStore:
             logger.debug("delete_library BM25 cleanup: %s", exc)
         logger.info("Deleted library %s", lib_id)
 
-    def list_libraries(self) -> list[dict]:
-        """Return [{lib_id, name, created_at}] — default library first."""
+    def get_library_owner(self, lib_id: str) -> str:
+        """Return owner_user_id for a library, or '' if missing / no owner."""
+        return self._load_registry().get(lib_id, {}).get("owner_user_id") or ""
+
+    def set_library_owner(self, lib_id: str, owner_user_id: str) -> None:
         reg = self._load_registry()
-        out = [
-            {"lib_id": lid, "name": info.get("name", lid),
-             "created_at": info.get("created_at", "")}
-            for lid, info in reg.items()
-        ]
+        if lib_id in reg:
+            reg[lib_id]["owner_user_id"] = owner_user_id or ""
+            self._save_registry(reg)
+
+    def list_libraries(self, *, owner_user_id: str = "", include_all: bool = False) -> list[dict]:
+        """Return [{lib_id, name, created_at, owner_user_id}] — default library first.
+
+        If *include_all* is False, only libraries owned by *owner_user_id* are returned.
+        Passing include_all=True is the admin path."""
+        reg = self._load_registry()
+        out: list[dict] = []
+        for lid, info in reg.items():
+            owner = info.get("owner_user_id") or ""
+            if not include_all and owner != owner_user_id:
+                continue
+            out.append({
+                "lib_id": lid,
+                "name": info.get("name", lid),
+                "created_at": info.get("created_at", ""),
+                "owner_user_id": owner,
+            })
         out.sort(key=lambda x: (x["lib_id"] != _DEFAULT_LIB_ID, x["created_at"]))
         return out
 

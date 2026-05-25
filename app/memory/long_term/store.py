@@ -117,8 +117,14 @@ class LongTermMemoryStore:
             "created_at": datetime.now().isoformat(),
         })
 
-    def get_profile_settings(self) -> dict[str, Any]:
-        profile = self._data.setdefault("user_profile", {})
+    def get_profile_settings(self, user_id: str = "") -> dict[str, Any]:
+        """Return *user_id*'s profile, falling back to the legacy global one
+        for users that haven't customised yet."""
+        per_user = self._data.setdefault("user_profiles", {})
+        profile = per_user.get(user_id) if user_id else None
+        if profile is None:
+            # Legacy single-tenant fallback (pre-Phase 4d)
+            profile = self._data.get("user_profile") or {}
         return {
             "display_name": profile.get("display_name", "研究者"),
             "avatar": profile.get("avatar", ""),
@@ -130,12 +136,15 @@ class LongTermMemoryStore:
         display_name: str = "",
         avatar: str = "",
         self_description: str = "",
+        user_id: str = "",
     ) -> dict[str, Any]:
-        profile = self._data.setdefault("user_profile", {})
+        per_user = self._data.setdefault("user_profiles", {})
+        key = user_id or "__legacy__"
+        profile = per_user.setdefault(key, {})
         profile["display_name"] = display_name.strip() or "研究者"
         profile["avatar"] = avatar.strip()
         profile["self_description"] = self_description.strip()
-        return self.get_profile_settings()
+        return self.get_profile_settings(user_id)
 
     # ── Context string for agent injection ────────────────────────────────────
 

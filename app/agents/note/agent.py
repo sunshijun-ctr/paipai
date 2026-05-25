@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 from typing import Any
 
 from app.agents.base.agent import BaseAgent
@@ -118,9 +119,15 @@ class NoteAgent(BaseAgent):
                 f"Paper: {n.get('title','')}\nQuestion: {n.get('question','')}\nAnswer: {n.get('answer','')}"
                 for n in notes
             )
-        if not source_content and task_type == "create_note_from_chat":
+        if not source_content and _wants_conversation_source(agent_input.user_goal, task_type):
             turns = agent_input.input_data.get("conversation_history", [])
-            source_content = "\n\n".join(f"{m.get('role')}: {m.get('content')}" for m in turns[-20:])
+            source_content = _conversation_to_source(turns, agent_input.user_goal, task_type)
+            logger.info(
+                "NoteAgent conversation fallback: task_type=%s history_turns=%d source_chars=%d",
+                task_type,
+                len(turns),
+                len(source_content),
+            )
 
         prompt = {
             "task_type": task_type,
@@ -133,7 +140,13 @@ class NoteAgent(BaseAgent):
                 system=_NOTE_SYSTEM,
             )
             if isinstance(raw, dict):
-                return raw
+                # Safety net: if the model returned an empty/refusal draft but we
+                # actually have material, build the note from the material rather
+                # than passing the refusal through. Only respect a refusal when we
+                # genuinely have nothing to save.
+                if _draft_has_content(raw) or not source_content.strip():
+                    return raw
+                logger.info("NoteAgent LLM returned empty draft despite source_content; using source fallback")
         except Exception as exc:
             logger.warning("NoteAgent LLM draft failed: %s", exc)
 
@@ -148,6 +161,105 @@ class NoteAgent(BaseAgent):
             result=result,
             next_suggestion="continue_note_management",
         )
+
+
+# Markers that indicate the user wants to capture the ongoing chat into a note,
+# even when the intent was classified as a generic create_note.
+_CHAT_REFERENCE_MARKERS = (
+    "对话", "聊天", "刚才", "刚刚", "之前", "上面", "上述", "这段", "那段",
+    "这个回答", "那个回答", "上一个回答", "上一条", "我们讨论", "我们聊",
+    "对话内容", "聊天记录",
+    "conversation", "chat", "above", "previous", "this answer", "what we discussed",
+)
+# A bare "save as note" command carries no content of its own, so it implicitly
+# refers to the preceding assistant answer.
+_SAVE_COMMAND_MARKERS = (
+    "保存", "存为", "存成", "存到", "存起来", "记下", "记一下", "收藏", "存笔记",
+    "save", "note it", "make a note", "save as note",
+)
+_WHOLE_CONVERSATION_MARKERS = ("整个", "全部", "所有", "完整", "整理", "whole", "entire", "all of")
+
+
+_NOTE_FILLER_TOKENS = (
+    *_SAVE_COMMAND_MARKERS,
+    "笔记", "notes", "note", "为", "成", "到", "起来", "一下", "把", "请",
+    "帮我", "帮", "这", "那", "个", "条", "下来", "记录", "the", "as", "a", "it",
+)
+
+
+# Task types that are, by definition, derived from the current session — if no
+# explicit source material was supplied, the conversation IS the material.
+_SESSION_DERIVED_TASK_TYPES = {"create_note_from_chat", "create_note_from_summary"}
+
+
+def _draft_has_content(draft: dict[str, Any]) -> bool:
+    """Did the LLM produce a usable note body (vs. a refusal/clarification)?"""
+    note = draft.get("note") or {}
+    return bool(str(note.get("content_markdown") or "").strip())
+
+
+def _wants_conversation_source(user_goal: str, task_type: str) -> bool:
+    """Should an empty-source note pull from the conversation?
+
+    True whenever the task is explicitly session-derived (from_chat / from_summary),
+    and also for a generic create_note when the user references the chat
+    ("把刚才的回答保存为笔记") or issues a bare save command ("保存为笔记")
+    that carries no content of its own.
+    """
+    if task_type in _SESSION_DERIVED_TASK_TYPES:
+        return True
+    if task_type not in {"create_note", "note", ""}:
+        return False
+    text = (user_goal or "").strip().lower()
+    if any(marker in text for marker in _CHAT_REFERENCE_MARKERS):
+        return True
+    return _is_bare_save_command(text)
+
+
+def _is_bare_save_command(text: str) -> bool:
+    """A save instruction that carries no content of its own.
+
+    "保存为笔记" / "存成笔记" → bare (implicitly saves the preceding answer).
+    "记一下：明天买牛奶" → not bare (it has its own content after the verb).
+    """
+    t = (text or "").lower()
+    if not any(marker in t for marker in _SAVE_COMMAND_MARKERS):
+        return False
+    residual = t
+    for token in _NOTE_FILLER_TOKENS:
+        residual = residual.replace(token, "")
+    residual = re.sub(r"[\s:：,，。.!！?？、…\-_/（）()]+", "", residual)
+    return len(residual) <= 2
+
+
+def _conversation_to_source(turns: list[dict[str, Any]], user_goal: str = "", task_type: str = "") -> str:
+    """Build note material from chat history.
+
+    Defaults to the most recent assistant answer plus the user question that
+    prompted it (a focused note). A summary note, or an explicit request for the
+    whole conversation, uses the recent transcript instead.
+    """
+    cleaned = [m for m in (turns or []) if str(m.get("content") or "").strip()]
+    if not cleaned:
+        return ""
+
+    wants_whole = (
+        task_type == "create_note_from_summary"
+        or any(marker in (user_goal or "").lower() for marker in _WHOLE_CONVERSATION_MARKERS)
+    )
+    if wants_whole:
+        selected = cleaned[-20:]
+    else:
+        last_assistant = next(
+            (i for i in range(len(cleaned) - 1, -1, -1) if cleaned[i].get("role") == "assistant"),
+            None,
+        )
+        if last_assistant is None:
+            selected = cleaned[-6:]
+        else:
+            selected = cleaned[max(0, last_assistant - 1): last_assistant + 1]
+
+    return "\n\n".join(f"{m.get('role')}: {m.get('content')}" for m in selected)
 
 
 def _resolve_note(svc, data: dict[str, Any]):
