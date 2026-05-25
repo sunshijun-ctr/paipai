@@ -29,7 +29,19 @@
 
 ## 🎬 演示
 
-> _在此放一段智能体回答科研问题的短 GIF —— 这是整页性价比最高的一处。_
+> 下面是各核心功能的实拍截图;想更直观,可在本节顶部再补一段操作 GIF(放进 `docs/screenshots/` 后用同样方式引用即可)。
+
+|  |  |
+|:---:|:---:|
+| ![论文检索](docs/screenshots/literature-search.png) | ![引文网络图](docs/screenshots/citation-graph.png) |
+| **论文检索** · 一句话检索 arXiv / Semantic Scholar,右侧实时结果面板 | **引文网络图** · 交互式可视化论文的引用 / 被引关系 |
+| ![PDF 阅读 + RAG 问答](docs/screenshots/pdf-rag-qa.png) | ![文献管理 / 知识库](docs/screenshots/library.png) |
+| **PDF 阅读 + RAG 问答** · 左侧原文、右侧有据可循的结构化解读 | **文献管理 / 知识库** · 入库、向量化、按库检索 |
+| ![网页搜索综合作答](docs/screenshots/web-research.png) | ![论文配图生成](docs/screenshots/figure-generation.png) |
+| **网页搜索综合作答** · 搜索 → 抓取正文 → 综合答案 | **论文配图生成** · 由论文内容生成方法流程图 / 示意图 |
+
+<details>
+<summary>幕后:一次研究请求的内部流转</summary>
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
@@ -42,6 +54,8 @@
 │  ▸ 综合 .......... 结构化综述 + 引用                            │
 └──────────────────────────────────────────────────────────────┘
 ```
+
+</details>
 
 ---
 

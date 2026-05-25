@@ -29,7 +29,19 @@
 
 ## 🎬 Demo
 
-> _Replace this with a short GIF of the agent answering a research question — it is the single highest-impact thing on the page._
+> Real screenshots of the core features below. For extra impact, drop a short GIF at the top of this section (add it to `docs/screenshots/` and reference it the same way).
+
+|  |  |
+|:---:|:---:|
+| ![Paper search](docs/screenshots/literature-search.png) | ![Citation graph](docs/screenshots/citation-graph.png) |
+| **Paper search** · one-line queries over arXiv / Semantic Scholar with a live results panel | **Citation graph** · interactive visualization of a paper's citations / references |
+| ![PDF reading + RAG QA](docs/screenshots/pdf-rag-qa.png) | ![Library / knowledge base](docs/screenshots/library.png) |
+| **PDF reading + RAG QA** · source on the left, grounded structured answer on the right | **Library / knowledge base** · ingest, embed, and retrieve per library |
+| ![Web research](docs/screenshots/web-research.png) | ![Figure generation](docs/screenshots/figure-generation.png) |
+| **Web research** · search → scrape → synthesized answer | **Figure generation** · turn paper content into method diagrams / schematics |
+
+<details>
+<summary>Under the hood: how one research request flows</summary>
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
@@ -42,6 +54,8 @@
 │  ▸ synthesize .... structured landscape + citations            │
 └──────────────────────────────────────────────────────────────┘
 ```
+
+</details>
 
 ---
 
