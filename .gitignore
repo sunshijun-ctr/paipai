@@ -63,3 +63,4 @@ research-assistant/data/webview-profile/
 Thumbs.db
 .idea/
 .vscode/
+.env* 
